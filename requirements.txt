@@ -1,0 +1,10 @@
+python-telegram-bot==20.8
+google-generativeai
+pytesseract
+pdf2image
+python-docx
+numpy
+faiss-cpu
+PyMuPDF
+Pillow
+python-dotenv
