@@ -29,20 +29,22 @@ def get_embedding(text):
 
 
 def generate_answer_with_gemini(user_query: str, retrieved_chunks: list[str]) -> str:
-    context = "\n\n".join(retrieved_chunks[:5])
+    context = "\n\n".join(retrieved_chunks[:5])  # ограничим до 5 фрагментов
+
     prompt = f"""
 Вы юридический помощник. Используйте приведённый ниже контекст из документов, чтобы ответить на запрос пользователя.
 
 Контекст:
-"""
+\"\"\"
 {context}
-"""
+\"\"\"
 
 Запрос пользователя:
 {user_query}
 
 Ответ (четко, кратко, по делу, без извинений):
 """
+
     model = genai.GenerativeModel("gemini-pro")
     response = model.generate_content(prompt)
     return response.text.strip()
