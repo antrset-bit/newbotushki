@@ -10,21 +10,31 @@ from docx import Document as DocxDocument
 import pytesseract
 import fitz  # PyMuPDF
 
-# --- Конфигурация ---
+# --- Конфигурация переменных ---
 DOC_FOLDER = "documents"
 FAISS_INDEX = "index.faiss"
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/embedding-001")
-GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/embedding-001")
 
 # --- Настройка Gemini ---
-genai.configure(api_key=GENAI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
 
-# --- Глобальные переменные ---
+def get_supported_text_model():
+    models = genai.list_models()
+    for m in models:
+        if "generateContent" in m.supported_generation_methods:
+            return m.name
+    raise ValueError("❌ Нет моделей, поддерживающих generateContent.")
+    
+TEXT_MODEL_NAME = get_supported_text_model()
+TEXT_MODEL = genai.GenerativeModel(TEXT_MODEL_NAME)
+
+# --- Глобальные переменные памяти ---
 TEXTS = []
 EMBEDDINGS = []
 
-# --- Вспомогательные функции для документов ---
+# --- Извлечение текста ---
 def extract_text_from_pdf(file_path):
     try:
         doc = fitz.open(file_path)
@@ -54,7 +64,7 @@ def split_text(text, max_tokens=300):
         chunks.append(current.strip())
     return chunks
 
-# --- Векторизация ---
+# --- Векторизация и индексация ---
 def get_embedding(text):
     result = genai.embed_content(
         model=EMBEDDING_MODEL,
@@ -63,7 +73,6 @@ def get_embedding(text):
     )
     return np.array(result["embedding"])
 
-# --- Индексация ---
 def index_documents():
     global TEXTS, EMBEDDINGS
     TEXTS, EMBEDDINGS = [], []
@@ -87,7 +96,7 @@ def index_documents():
         index.add(np.array(EMBEDDINGS).astype("float32"))
         faiss.write_index(index, FAISS_INDEX)
 
-# --- Генерация ответа с Gemini ---
+# --- Генерация ответа через Gemini ---
 def generate_answer_with_gemini(user_query: str, retrieved_chunks: list[str]) -> str:
     context = "\n\n".join(retrieved_chunks[:5])
     prompt = f"""
@@ -103,32 +112,31 @@ def generate_answer_with_gemini(user_query: str, retrieved_chunks: list[str]) ->
 
 Ответ (четко, кратко, по делу, без извинений):
 """
-    model = genai.GenerativeModel("gemini-pro")
-    response = model.generate_content(prompt)
+    response = TEXT_MODEL.generate_content(prompt)
     return response.text.strip()
 
-# --- Обработчики Telegram ---
+# --- Telegram handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь текст запроса или загрузи PDF, DOCX, TXT файл.")
+    await update.message.reply_text("Привет! Загрузите .pdf, .docx или .txt файл, затем задайте вопрос.")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document: Document = update.message.document
     fname = document.file_name
     ext = fname.lower().split(".")[-1]
     if ext not in ("pdf", "docx", "txt"):
-        await update.message.reply_text("Поддерживаются только PDF, DOCX и TXT файлы.")
+        await update.message.reply_text("Поддерживаются только PDF, DOCX, TXT.")
         return
     os.makedirs(DOC_FOLDER, exist_ok=True)
     file_path = os.path.join(DOC_FOLDER, fname)
     new_file = await context.bot.get_file(document.file_id)
     await new_file.download_to_drive(file_path)
-    await update.message.reply_text("Файл загружен. Индексация...")
+    await update.message.reply_text("Файл загружен. Индексация началась...")
     index_documents()
-    await update.message.reply_text("Индексация завершена. Можешь задать вопрос.")
+    await update.message.reply_text("Индексация завершена. Теперь можно задавать вопросы.")
 
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(FAISS_INDEX):
-        await update.message.reply_text("Нет проиндексированных документов. Сначала загрузите файл.")
+        await update.message.reply_text("Нет проиндексированных документов. Пожалуйста, загрузите файл.")
         return
     user_query = update.message.text
     q_emb = get_embedding(user_query).astype("float32")
@@ -138,7 +146,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = generate_answer_with_gemini(user_query, retrieved)
     await update.message.reply_text(answer[:4096])
 
-# --- Запуск приложения ---
+# --- Основной запуск ---
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
