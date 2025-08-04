@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import faiss
+import asyncio
 import google.generativeai as genai
 from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -21,12 +22,15 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/embedding-001")
 genai.configure(api_key=GEMINI_API_KEY)
 
 def get_supported_text_model():
-    models = genai.list_models()
-    for m in models:
-        if "generateContent" in m.supported_generation_methods:
-            return m.name
-    raise ValueError("❌ Нет моделей, поддерживающих generateContent.")
-    
+    try:
+        models = genai.list_models()
+        for m in models:
+            if "generateContent" in m.supported_generation_methods:
+                return m.name
+    except Exception as e:
+        print("❌ Ошибка при получении списка моделей:", e)
+    return "models/gemini-pro"  # fallback
+
 TEXT_MODEL_NAME = get_supported_text_model()
 TEXT_MODEL = genai.GenerativeModel(TEXT_MODEL_NAME)
 
@@ -98,7 +102,7 @@ def index_documents():
 
 # --- Генерация ответа через Gemini ---
 def generate_answer_with_gemini(user_query: str, retrieved_chunks: list[str]) -> str:
-    context = "\n\n".join(retrieved_chunks[:5])
+    context = "\n\n".join(retrieved_chunks[:2])  # Ограничим до 2 блоков
     prompt = f"""
 Вы юридический помощник. Используйте приведённый ниже контекст из документов, чтобы ответить на запрос пользователя.
 
@@ -110,10 +114,14 @@ def generate_answer_with_gemini(user_query: str, retrieved_chunks: list[str]) ->
 Запрос пользователя:
 {user_query}
 
-Ответ (четко, кратко, по делу, без извинений):
+Ответ (четко, кратко, по делу):
 """
-    response = TEXT_MODEL.generate_content(prompt)
-    return response.text.strip()
+    try:
+        response = TEXT_MODEL.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print("⚠️ Ошибка генерации Gemini:", e)
+        return "⚠️ Квота превышена или временная ошибка. Попробуйте позже."
 
 # --- Telegram handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
