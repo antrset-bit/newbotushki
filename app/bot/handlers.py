@@ -20,7 +20,7 @@ from app.services.extract import extract_text_from_pdf, extract_text_from_docx, 
 from app.services.chunking import smart_split_text
 from app.services.embeddings import get_embedding
 import io
-import tempfileƒ
+import tempfile
 from app.ocr.postprocess import postprocess
 
 from docx import Document as DocxDocument
