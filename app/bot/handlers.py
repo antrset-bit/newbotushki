@@ -25,6 +25,7 @@ from docx.enum.text import WD_COLOR_INDEX
 from docx.shared import Pt
 
 import fitz  # PyMuPDF
+from pdf2image import convert_from_path
 import pytesseract
 from pytesseract import Output as TessOutput
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,12 +42,12 @@ TM_MODE = "tm"
 
 # ---- OCR defaults tuned for Russian docs ----
 FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
-OCR_DPI = int(os.getenv("OCR_DPI", "220"))
-PDF_COMPRESS = os.getenv("PDF_COMPRESS", "0") == "1"  # по умолчанию выключено ради скорости
+OCR_DPI = int(os.getenv("OCR_DPI", "300"))            # «старая» надёжная схема
+PDF_COMPRESS = os.getenv("PDF_COMPRESS", "1") == "1"  # по умолчанию сжимаем
 OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "0"))  # 0 = все страницы
 POPPLER_PATH = os.getenv("POPPLER_PATH", "").strip() or None
 TESS_LANG = os.getenv("TESS_LANG", "rus")
-TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
+TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 3 --psm 6 -c preserve_interword_spaces=1")
 
 # Dedup windows
 PDF_DEDUP_TTL = 120
@@ -200,7 +201,7 @@ def _save_docx_compare_tables(filename: str, doc_name_a: str, doc_name_b: str, t
     doc.save(path)
     return path
 
-# ---------- Новый алгоритм сравнения: слева только отличия (отсутствуют в DOCX), справа — полный DOCX ----------
+# ---------- Наш «новый» формат сравнения: слева только отличия (отсутствуют в DOCX), справа — полный DOCX ----------
 def _normalize_ru(s: str) -> str:
     s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
@@ -267,127 +268,68 @@ def save_docx_two_column_compare(output_path: str, pdf_text: str, docx_text: str
     doc.save(output_path)
     return output_path
 
-# ---------- Быстрый гибрид: берём текстовый слой, иначе OCR; сборка DOCX по абзацам ----------
-def _page_has_good_text(page: "fitz.Page") -> bool:
-    txt = page.get_text("text") or ""
-    txt = txt.strip()
-    return len(re.sub(r"\s+", "", txt)) >= 80
-
-def _extract_or_ocr_page(doc: "fitz.Document", page_index: int, dpi: int, lang: str) -> list[str]:
-    page = doc.load_page(page_index)
-    if _page_has_good_text(page) and not FORCE_OCR:
-        blocks = page.get_text("blocks") or []
-        blocks.sort(key=lambda b: (round(b[1]), round(b[0])))
-        paras = []
-        for b in blocks:
-            t = (b[4] or "").strip()
-            if t:
-                t = _normalize_confusables_ru(t)
-                for par in re.split(r"\n\s*\n", t):
-                    par = postprocess(par.strip())
-                    if par:
-                        paras.append(par)
-        return paras
-    # OCR
-    zoom = max(200, min(dpi, 240)) / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = None
-    data = None
+# ---------- PDF helpers (СТАРАЯ НАДЁЖНАЯ СХЕМА) ----------
+def _compress_pdf_sync(src: str) -> str:
     try:
-        from PIL import Image
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        data = pytesseract.image_to_data(img, lang=lang, config=TESS_CONFIG, output_type=TessOutput.DICT)
-    except Exception:
-        fd, tmp = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
-        try:
-            pix.save(tmp)
-            data = pytesseract.image_to_data(tmp, lang=lang, config=TESS_CONFIG, output_type=TessOutput.DICT)
-        finally:
-            try: os.remove(tmp)
-            except Exception: pass
-    paras: list[str] = []
-    if not data or not data.get("text"):
-        try:
-            ocr_text = pytesseract.image_to_string(img, lang=lang, config=TESS_CONFIG) if img else ""
-        except Exception:
-            ocr_text = ""
-        ocr_text = postprocess(_normalize_confusables_ru(ocr_text))
-        for line in filter(None, (l.strip() for l in ocr_text.splitlines())):
-            paras.append(line)
-        return paras
-    n = len(data["text"])
-    buckets: dict[tuple[int,int], dict[int, list[tuple[int,str]]]] = {}
-    for i in range(n):
-        txt = (data["text"][i] or "").strip()
-        if not txt:
-            continue
-        conf_raw = str(data.get("conf", ["-1"]*n)[i])
-        try:
-            conf = int(conf_raw)
-        except Exception:
-            conf = -1
-        if conf < 0:
-            continue
-        b = int(data.get("block_num", [0]*n)[i] or 0)
-        p = int(data.get("par_num",   [0]*n)[i] or 0)
-        l = int(data.get("line_num",  [0]*n)[i] or 0)
-        x = int(data.get("left",      [0]*n)[i] or 0)
-        buckets.setdefault((b, p), {}).setdefault(l, []).append((x, txt))
-    for (b,p) in sorted(buckets.keys()):
-        lines = buckets[(b,p)]
-        para_lines = []
-        for ln in sorted(lines.keys()):
-            words = sorted(lines[ln], key=lambda t: t[0])
-            line_text = " ".join(w for _, w in words)
-            line_text = postprocess(_normalize_confusables_ru(line_text))
-            if line_text:
-                para_lines.append(line_text)
-        para = "\n".join(para_lines).strip()
-        if para:
-            paras.append(para)
-    return paras
+        doc = fitz.open(src)
+        out = os.path.join(DOC_FOLDER, f"compressed_{Path(src).name}")
+        doc.save(out, garbage=4, deflate=True, clean=True, linear=True)
+        doc.close()
+        return out
+    except Exception as e:
+        logger.warning("PDF compress failed for %s: %r", src, e)
+        return src
 
-def _ocr_pdf_to_docx_layout(pdf_path: str, dpi: int, max_pages: int, _poppler_path: Optional[str], lang: str) -> str:
-    doc = fitz.open(pdf_path)
-    total_pages = doc.page_count
-    pages = list(range(total_pages))
-    if max_pages and max_pages > 0:
-        pages = pages[:max_pages]
-    paras_per_page: dict[int, list[str]] = {}
-    ocr_needed = []
-    for i in pages:
-        page = doc.load_page(i)
-        if _page_has_good_text(page) and not FORCE_OCR:
-            paras_per_page[i] = _extract_or_ocr_page(doc, i, dpi, lang)
-        else:
-            ocr_needed.append(i)
-    if ocr_needed:
-        workers = min(os.cpu_count() or 4, 6)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_extract_or_ocr_page, doc, i, dpi, lang): i for i in ocr_needed}
-            for fut in as_completed(futures):
-                i = futures[fut]
-                try:
-                    paras_per_page[i] = fut.result()
-                except Exception as e:
-                    logger.warning("OCR failed p%s: %r", i, e)
-                    paras_per_page[i] = []
-    out = DocxDocument()
-    for idx, i in enumerate(pages):
-        for para in paras_per_page.get(i, []):
-            for part in re.split(r"\n{2,}", para):
-                part = part.strip()
-                if part:
-                    out.add_paragraph(part)
-        if idx < len(pages)-1:
-            out.add_page_break()
+def _ocr_pdf_to_text_sync(pdf_path: str, dpi: int, max_pages: int, poppler_path: Optional[str], tess_lang: str) -> str:
+    try:
+        kwargs = {"dpi": dpi, "fmt": "png"}
+        if poppler_path:
+            kwargs["poppler_path"] = poppler_path
+        images = convert_from_path(pdf_path, **kwargs)
+        if max_pages and max_pages > 0:
+            images = images[:max_pages]
+
+        texts = []
+        for img in images:
+            try:
+                ocr_text = pytesseract.image_to_string(img, lang=tess_lang, config=TESS_CONFIG)
+                ocr_text = _normalize_confusables_ru(ocr_text)
+            except Exception as e:
+                logger.warning("OCR page failed: %r", e)
+                ocr_text = ""
+            texts.append(ocr_text)
+        return "\n".join(texts).strip()
+    except Exception as e:
+        logger.error("OCR failed for %s: %r", pdf_path, e)
+        return ""
+
+def _save_text_as_docx(text: str, base_name: str) -> str:
     os.makedirs(DOC_FOLDER, exist_ok=True)
-    safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", Path(pdf_path).stem)[:60]
-    out_path = os.path.join(DOC_FOLDER, f"{int(time.time())}_{safe_base}_ocr.docx")
-    out.save(out_path)
-    return out_path
+    safe = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", base_name)[:60]
+    out = os.path.join(DOC_FOLDER, f"{int(time.time())}_{safe}.docx")
+    doc = DocxDocument()
+    for line in (text or "").split("\n"):
+        doc.add_paragraph(line)
+    doc.save(out)
+    return out
+
+# --- надёжная отправка документов с ретраями ---
+async def _send_document_with_retry(bot, chat_id: int, file_path: str, filename: str, caption: str | None = None, tries: int = 3):
+    last_err = None
+    for attempt in range(tries):
+        try:
+            with open(file_path, "rb") as f:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(f, filename=filename),
+                    caption=caption
+                )
+            return True
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(2 ** (attempt + 1))
+    logger.warning("send_document failed after retries: %r", last_err)
+    return False
 
 # ---------- Local fallbacks (no LLM) ----------
 def _fallback_summary(text: str) -> str:
@@ -435,35 +377,17 @@ def _fallback_check(text: str) -> str:
     lines = [f"• {name}: {'OK' if ok else 'ПРОВЕРИТЬ/ОТСУТСТВУЕТ'}" for name, ok in checks]
     return "ПРОВЕРКА ДОГОВОРА (эвристика без ИИ):\n" + "\n".join(lines)
 
-# --- надёжная отправка документов с ретраями ---
-async def _send_document_with_retry(bot, chat_id: int, file_path: str, filename: str, caption: str | None = None, tries: int = 3):
-    last_err = None
-    for attempt in range(tries):
-        try:
-            with open(file_path, "rb") as f:
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=InputFile(f, filename=filename),
-                    caption=caption
-                )
-            return True
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(2 ** (attempt + 1))
-    logger.warning("send_document failed after retries: %r", last_err)
-    return False
-
 # ---------- Handlers ----------
 async def start(update: Update, context: Any):
     context.user_data["mode"] = "docs"
     usage_left = "∞" if is_admin(update.effective_user.id) else max(0, DAILY_FREE_LIMIT - get_usage(update.effective_user.id))
     msg = (
         "Привет!\n\n"
-        "1) 🗂️ Работа с документами — загрузите DOC/DOCX/PDF; для PDF автоматически делаем OCR и сохраняем в DOCX.\n"
+        "1) 🗂️ Работа с документами — загрузите DOC/DOCX/PDF; для PDF автоматически делаем сжатие+OCR и сохраняем в DOCX.\n"
         "2) Часто задаваемые вопросы — классический режим с глобальным индексом (PDF/DOCX/TXT).\n"
         "3) 🤖 AI-чат — свободный диалог.\n"
         "4) 🏷️ Товарные знаки — поиск по Google Sheets.\n"
-        "Команда: /pdf_to_docx — конвертация последнего загруженного PDF в DOCX (OCR с сохранением порядка).\n\n"
+        "Команда: /pdf_to_docx — конвертация последнего загруженного PDF в DOCX (OCR постранично).\n\n"
         f"Сегодняшний лимит AI-чат: {usage_left} сообщений."
     )
     await update.message.reply_text(msg, reply_markup=MAIN_KB)
@@ -486,12 +410,12 @@ async def work_mode(update: Update, context: Any):
     context.user_data.setdefault("work_docs", [])
     await update.message.reply_text(
         "Режим: 🗂️ Работа с документами.\n\n"
-        "Пришлите DOC/DOCX/PDF — добавлю в контекст. Для PDF: OCR → сохраняем как DOCX.\n"
+        "Пришлите DOC/DOCX/PDF — добавлю в контекст. Для PDF: сжатие → OCR → сохраняем как DOCX.\n"
         "Команды:\n"
         "• /doc_summary — резюме последнего документа\n"
         "• /doc_check — проверить договор на ошибки/риски\n"
         "• /doc_compare — сравнить два последних загруженных файла (в левой колонке — только то, чего нет в DOCX; справа — весь DOCX)\n"
-        "• /pdf_to_docx — конвертировать последний загруженный PDF в DOCX (OCR с сохранением порядка)\n"
+        "• /pdf_to_docx — конвертировать последний загруженный PDF в DOCX (OCR постранично)\n"
         "• /doc_clear — удалить все ранее загруженные документы\n"
         "Любой вопрос в этом режиме — ответ с опорой на загруженные файлы.",
         reply_markup=MAIN_KB
@@ -537,22 +461,27 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
         key = _pdf_job_key(document)
         if _pdf_job_is_running(context, key):
             return
-        sent = await update.message.reply_text("Принят PDF. Выполняю OCR…")
+        sent = await update.message.reply_text("Принят PDF. Выполняю сжатие и OCR…")
         _pdf_job_start(context, key, sent.message_id)
         try:
             def _job(pdf_path: str):
-                pdf_use = pdf_path  # без сжатия ради скорости
+                # 1) Сжатие (если включено)
+                pdf_use = _compress_pdf_sync(pdf_path) if PDF_COMPRESS else pdf_path
+                # 2) Попытка быстрого извлечения слоя текста
                 quick = extract_text_from_pdf(pdf_use) or ""
-                if (not FORCE_OCR) and len(quick.strip()) > 80:
+                # 3) Решение: если есть понятный текст и не принужденный OCR — берём быстрый путь;
+                #    иначе — OCR всех страниц через pdf2image+tesseract
+                if (not FORCE_OCR) and len(quick.strip()) > 50:
                     use_text = _normalize_confusables_ru(quick)
-                    docx_path = _save_docx_report(f"{int(time.time())}_{Path(fname).stem}_from_text.docx", "Текст из PDF (без OCR)", use_text)
                 else:
-                    docx_path = _ocr_pdf_to_docx_layout(pdf_use, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
-                    use_text = quick if quick.strip() else ""
+                    use_text = _ocr_pdf_to_text_sync(pdf_use, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
+                # 4) Постобработка и сохранение в DOCX (построчно)
                 use_text = postprocess(use_text)
-                chunks = smart_split_text(use_text) if use_text else []
-                return use_text, chunks, docx_path, pdf_use
-            text, chunks, derived_docx, pdf_final = await asyncio.to_thread(_job, file_path)
+                docx_path = _save_text_as_docx(use_text, f"{Path(fname).stem}_ocr")
+                # 5) Подготовка чанков для ответов
+                chunks = smart_split_text(use_text)
+                return use_text, chunks, docx_path, pdf_use != pdf_path, pdf_use
+            text, chunks, derived_docx, compressed, pdf_final = await asyncio.to_thread(_job, file_path)
             context.user_data.setdefault("work_docs", []).append({
                 "name": fname, "path": file_path, "text": text or "", "chunks": chunks or [],
                 "from_pdf": True, "docx_path": derived_docx, "pdf_processed": pdf_final,
@@ -560,14 +489,19 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
             try:
                 await update.effective_chat.edit_message_text(
                     message_id=sent.message_id,
-                    text="PDF добавлен в контекст. OCR/извлечение завершены."
+                    text=f"PDF добавлен в контекст. {'Сжатие выполнено. ' if PDF_COMPRESS else ''}"
+                         f"OCR: {'успех' if (text or '').strip() else 'не удалось (использую извлечённый текст)'}."
                 )
             except Exception:
-                await update.message.reply_text("PDF добавлен в контекст. OCR/извлечение завершены.")
+                await update.message.reply_text(
+                    f"PDF добавлен в контекст. {'Сжатие выполнено. ' if PDF_COMPRESS else ''}"
+                    f"OCR: {'успех' if (text or '').strip() else 'не удалось (использую извлечённый текст)'}."
+                )
         finally:
             _pdf_job_finish(context, key)
         return
 
+    # DOC / DOCX
     if ext == "docx":
         text = extract_text_from_docx(file_path)
     else:
@@ -682,7 +616,7 @@ def _get_last_pdf_doc(context) -> dict | None:
             return rec
     return None
 
-# Новая команда: /pdf_to_docx
+# Новая команда: /pdf_to_docx (использует ту же «старую» схему OCR → простой DOCX)
 async def pdf_to_docx(update: Update, context: Any):
     rec = _get_last_pdf_doc(context)
     if not rec:
@@ -693,10 +627,17 @@ async def pdf_to_docx(update: Update, context: Any):
         await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
         return
     try:
-        out_docx = _ocr_pdf_to_docx_layout(pdf_path, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
+        # 1) Сжатие (если включено)
+        use_pdf = _compress_pdf_sync(pdf_path) if PDF_COMPRESS else pdf_path
+        # 2) OCR всех страниц
+        text = _ocr_pdf_to_text_sync(use_pdf, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
+        text = postprocess(text or "")
+        # 3) Сохранение в DOCX
+        out_docx = _save_text_as_docx(text, f"{Path(pdf_path).stem}_ocr")
     except Exception as e:
         await update.message.reply_text(f"Ошибка OCR/DOCX: {e!r}")
         return
+
     ok = await _send_document_with_retry(
         bot=context.bot,
         chat_id=update.effective_chat.id,
@@ -759,40 +700,16 @@ async def doc_check(update: Update, context: Any):
     await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
 async def doc_compare(update: Update, context: Any):
-    """
-    В ЛЕВОЙ колонке: показываем только то, чего НЕТ в DOCX вообще (даже если в PDF это просто «переехало»).
-    В ПРАВОЙ колонке: полный текст DOCX.
-    """
     docs = context.user_data.get("work_docs") or []
     if len(docs) < 2:
         await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
         return
     a, b = docs[-2], docs[-1]
-    name_a = (a.get("name") or "").lower()
-    name_b = (b.get("name") or "").lower()
-    if name_a.endswith(".docx") and not name_b.endswith(".docx"):
-        text_docx = a.get("text") or ""
-        text_pdf  = b.get("text") or ""
-        base_left = f"{Path(b['name']).stem}"
-        base_docx = f"{Path(a['name']).stem}"
-    elif name_b.endswith(".docx") and not name_a.endswith(".docx"):
-        text_docx = b.get("text") or ""
-        text_pdf  = a.get("text") or ""
-        base_left = f"{Path(a['name']).stem}"
-        base_docx = f"{Path(b['name']).stem}"
-    else:
-        text_pdf  = a.get("text") or ""
-        text_docx = b.get("text") or ""
-        base_left = f"{Path(a['name']).stem}"
-        base_docx = f"{Path(b['name']).stem}"
-    text_pdf  = postprocess(text_pdf or "")
-    text_docx = postprocess(text_docx or "")
-
-    os.makedirs(DOC_FOLDER, exist_ok=True)
-    filename = f"{int(time.time())}_compare_{base_left}_vs_{base_docx}.docx"
-    out_path = os.path.join(DOC_FOLDER, filename)
-    out_path = save_docx_two_column_compare(out_path, text_pdf, text_docx)
-    await _send_document_with_retry(update.get_bot(), update.effective_chat.id, out_path, filename)
+    text_a = postprocess(a.get("text") or "")
+    text_b = postprocess(b.get("text") or "")
+    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
+    path = _save_docx_compare_tables(filename, a['name'], b['name'], text_a, text_b)
+    await _send_document_with_retry(update.get_bot(), update.effective_chat.id, path, filename)
 
 async def doc_clear(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
