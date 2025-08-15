@@ -82,7 +82,7 @@ async def ocr_endpoint(file: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
         tmp.write(await file.read())
         tmp.flush()
-        text = ocr_file(tmp.name)
+        text, _docx = ocr_file(tmp.name)
     return text
 
 @app.post("/ocr/clean", response_class=PlainTextResponse)
