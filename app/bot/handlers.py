@@ -25,6 +25,7 @@ from app.ocr.postprocess import postprocess
 
 from docx import Document as DocxDocument
 from docx.enum.text import WD_COLOR_INDEX
+from docx.shared import Pt  # для форматирования заголовка в сравнении
 
 FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
 
@@ -38,7 +39,8 @@ AI_LABEL   = "🤖 AI-чат"
 DOCS_LABEL = "Часто задаваемые вопросы"
 WORK_LABEL = "🗂️ Работа с документами"
 TM_LABEL   = "🏷️ Товарные знаки"
-MAIN_KB    = ReplyKeyboardMarkup([[AI_LABEL, WORK_LABEL, TM_LABEL], [DOCS_LABEL]], resize_keyboard=True)
+PDF2TXT_LABEL = "📝 PDF → TXT"  # новая кнопка
+MAIN_KB    = ReplyKeyboardMarkup([[AI_LABEL, WORK_LABEL, TM_LABEL], [DOCS_LABEL, PDF2TXT_LABEL]], resize_keyboard=True)
 
 TM_MODE = "tm"
 
@@ -204,7 +206,7 @@ def _save_text_as_docx(text: str, base_name: str) -> str:
     doc.save(out)
     return out
 
-# ---------- DOCX helpers ----------
+# ---------- DOCX helpers (стандартный отчёт изменений построчно — оставляем как было) ----------
 def _save_docx_report(filename: str, title: str, body: str) -> str:
     os.makedirs(DOC_FOLDER, exist_ok=True)
     path = os.path.join(DOC_FOLDER, filename)
@@ -266,6 +268,93 @@ def _save_docx_compare_tables(filename: str, doc_name_a: str, doc_name_b: str, t
     doc.save(path)
     return path
 
+# ---------- Новый алгоритм сравнения: слева только отличия (отсутствуют в DOCX), справа — полный DOCX ----------
+def _normalize_ru(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{2,}", "\n\n", s)
+    return s.strip()
+
+def _sentences(text: str) -> list[str]:
+    text = (text or "").replace("…", ".")
+    parts: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        block = block.strip()
+        if not block:
+            continue
+        subs = re.split(r"(?<=[\.\!\?])\s+(?=[А-ЯA-Z])", block)
+        if not subs:
+            subs = [block]
+        for s in subs:
+            s = s.strip()
+            if s:
+                parts.append(s)
+    return parts
+
+def _is_similar(a: str, b: str, threshold: float = 0.88) -> bool:
+    ra = a.casefold()
+    rb = b.casefold()
+    return difflib.SequenceMatcher(None, ra, rb).ratio() >= threshold
+
+def _compute_only_differences(pdf_text: str, docx_text: str) -> list[str]:
+    """
+    Возвращаем только те фрагменты из PDF, которых «нет» в DOCX
+    (независимо от позиции в документе).
+    """
+    pdf_text_n = _normalize_ru(pdf_text)
+    docx_text_n = _normalize_ru(docx_text)
+
+    pdf_sents  = _sentences(pdf_text_n)
+    docx_sents = _sentences(docx_text_n)
+
+    # быстрый ключ для «почти идентичных» строк
+    docx_keys = set()
+    for s in docx_sents:
+        k = re.sub(r"[^А-Яа-я0-9]+", "", s.casefold())
+        if k:
+            docx_keys.add(k)
+
+    diffs: list[str] = []
+    for s in pdf_sents:
+        key = re.sub(r"[^А-Яа-я0-9]+", "", s.casefold())
+        present = key in docx_keys
+        if present:
+            continue
+        similar = any(_is_similar(s, t, 0.88) for t in docx_sents)
+        if not similar:
+            diffs.append(s)
+    return diffs
+
+def save_docx_two_column_compare(output_path: str, pdf_text: str, docx_text: str) -> str:
+    """
+    Итоговый отчёт:
+    - слева: ТОЛЬКО отличия PDF (фрагменты, которых нет в DOCX вовсе);
+    - справа: полный текст DOCX.
+    """
+    diffs = _compute_only_differences(pdf_text, docx_text)
+
+    doc = DocxDocument()
+    p = doc.add_paragraph("Сравнение документов: отличия PDF vs ОРИГИНАЛ (DOCX)")
+    if p.runs:
+        p.runs[0].bold = True
+        p.runs[0].font.size = Pt(12)
+
+    table = doc.add_table(rows=1, cols=2)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Отличается от DOCX (показываем только отсутствующее)"
+    hdr[1].text = "Оригинал: текст DOCX"
+
+    row = table.add_row().cells
+    if diffs:
+        left = "\n• " + "\n• ".join(diffs)
+    else:
+        left = "Отличий не обнаружено — всё содержимое PDF присутствует в DOCX."
+    row[0].text = left
+    row[1].text = _normalize_ru(docx_text)
+
+    doc.save(output_path)
+    return output_path
+
 # ---------- Local fallbacks (no LLM) ----------
 def _fallback_summary(text: str) -> str:
     text = (text or "").strip()
@@ -321,7 +410,8 @@ async def start(update: Update, context: Any):
         "1) 🗂️ Работа с документами — загрузите DOC/DOCX/PDF; для PDF автоматически делаем сжатие+OCR и сохраняем в DOCX.\n"
         "2) Часто задаваемые вопросы — классический режим с глобальным индексом (PDF/DOCX/TXT).\n"
         "3) 🤖 AI-чат — свободный диалог.\n"
-        "4) 🏷️ Товарные знаки — поиск по Google Sheets.\n\n"
+        "4) 🏷️ Товарные знаки — поиск по Google Sheets.\n"
+        "5) 📝 PDF → TXT — конвертация последнего загруженного PDF в текстовый файл.\n\n"
         f"Сегодняшний лимит AI-чат: {usage_left} сообщений."
     )
     await update.message.reply_text(msg, reply_markup=MAIN_KB)
@@ -348,7 +438,8 @@ async def work_mode(update: Update, context: Any):
         "Команды:\n"
         "• /doc_summary — резюме последнего документа\n"
         "• /doc_check — проверить договор на ошибки/риски\n"
-        "• /doc_compare — сравнить два последних загруженных файла (для PDF сравнивается OCR-ДOCX)\n"
+        "• /doc_compare — сравнить два последних загруженных файла (в левой колонке — только то, чего нет в DOCX; справа — весь DOCX)\n"
+        "• /pdf_to_txt — конвертировать последний загруженный PDF в TXT\n"
         "• /doc_clear — удалить все ранее загруженные документы\n"
         "Любой вопрос в этом режиме — ответ с опорой на загруженные файлы.",
         reply_markup=MAIN_KB
@@ -548,8 +639,6 @@ def _get_last_pdf_doc(context) -> dict | None:
             return rec
     return None
 
-
-
 async def pdf_to_txt(update: Update, context: Any):
     """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
     rec = _get_last_pdf_doc(context)
@@ -591,7 +680,6 @@ async def pdf_to_txt(update: Update, context: Any):
         except Exception:
             pass
 
-
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
     if not docs:
@@ -632,19 +720,50 @@ async def doc_check(update: Update, context: Any):
     if not answer.strip() or answer.strip().startswith("⚠️"):
         answer = _fallback_check(last["text"])
     await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
-    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
+    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path[last['name']).stem}")  # noqa: E999
 
 async def doc_compare(update: Update, context: Any):
+    """
+    В ЛЕВОЙ колонке: показываем только то, чего НЕТ в DOCX вообще (даже если в PDF это просто «переехало»).
+    В ПРАВОЙ колонке: полный текст DOCX.
+    """
     docs = context.user_data.get("work_docs") or []
     if len(docs) < 2:
         await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
         return
     a, b = docs[-2], docs[-1]
-    text_a = a.get("text") or ""
-    text_b = b.get("text") or ""
-    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
-    path = _save_docx_compare_tables(filename, a['name'], b['name'], text_a, text_b)
-    with open(path, "rb") as f:
+
+    # Определим оригинал DOCX и соответствующий PDF-текст
+    name_a = (a.get("name") or "").lower()
+    name_b = (b.get("name") or "").lower()
+    if name_a.endswith(".docx") and not name_b.endswith(".docx"):
+        text_docx = a.get("text") or ""
+        text_pdf  = b.get("text") or ""
+        base_left = f"{Path(b['name']).stem}"
+        base_docx = f"{Path(a['name']).stem}"
+    elif name_b.endswith(".docx") and not name_a.endswith(".docx"):
+        text_docx = b.get("text") or ""
+        text_pdf  = a.get("text") or ""
+        base_left = f"{Path(a['name']).stem}"
+        base_docx = f"{Path(b['name']).stem}"
+    else:
+        # если оба не DOCX или оба DOCX — считаем, что второй — оригинал, первый — сравниваемый
+        text_pdf  = a.get("text") or ""
+        text_docx = b.get("text") or ""
+        base_left = f"{Path(a['name']).stem}"
+        base_docx = f"{Path(b['name']).stem}"
+
+    # постобработка на всякий случай
+    text_pdf  = postprocess(text_pdf or "")
+    text_docx = postprocess(text_docx or "")
+
+    # сборка отчёта
+    os.makedirs(DOC_FOLDER, exist_ok=True)
+    filename = f"{int(time.time())}_compare_{base_left}_vs_{base_docx}.docx"
+    out_path = os.path.join(DOC_FOLDER, filename)
+    out_path = save_docx_two_column_compare(out_path, text_pdf, text_docx)
+
+    with open(out_path, "rb") as f:
         await update.message.reply_document(InputFile(f, filename=filename))
 
 async def doc_clear(update: Update, context: Any):
@@ -673,6 +792,8 @@ async def handle_text(update: Update, context: Any):
         await tm_mode(update, context); return
     if user_query == WORK_LABEL:
         await work_mode(update, context); return
+    if user_query == PDF2TXT_LABEL:
+        await pdf_to_txt(update, context); return
 
     if mode == "ai":
         uid = update.effective_user.id
@@ -757,6 +878,7 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(WORK_LABEL)}$"), work_mode))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(DOCS_LABEL)}$"), docs_mode))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(PDF2TXT_LABEL)}$"), pdf_to_txt))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(AI_LABEL)}$"), ai_mode))
 
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
