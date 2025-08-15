@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os, re, time, asyncio, logging, difflib, tempfile
 from pathlib import Path
 from typing import Any, Optional
@@ -41,12 +42,16 @@ TM_MODE = "tm"
 
 # ---- OCR defaults tuned for Russian docs ----
 FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
-OCR_DPI = int(os.getenv("OCR_DPI", "220"))
+# ↓ снижение DPI по умолчанию ради скорости; можно вернуть через переменную окружения
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))
 PDF_COMPRESS = os.getenv("PDF_COMPRESS", "0") == "1"  # по умолчанию выключено ради скорости
-OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "0"))  # 0 = все страницы
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "0"))  # 0 = все страницы (или дефолтное ограничение ниже)
 POPPLER_PATH = os.getenv("POPPLER_PATH", "").strip() or None
 TESS_LANG = os.getenv("TESS_LANG", "rus")
 TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
+# Новые ограничители
+OCR_DEFAULT_CAP = int(os.getenv("OCR_DEFAULT_CAP", "8"))  # если OCR_MAX_PAGES=0, обрабатываем не более N страниц
+OCR_OVERALL_TIMEOUT = int(os.getenv("OCR_OVERALL_TIMEOUT", "360"))  # общий таймаут на /pdf_to_docx, сек
 
 # Dedup windows
 PDF_DEDUP_TTL = 120
@@ -124,6 +129,27 @@ def _idx_start(context, key: str, msg_id: int | None):
 
 def _idx_finish(context, key: str):
     jobs = context.bot_data.setdefault("index_jobs", {})
+    jobs.pop(key, None)
+
+# --- /pdf_to_docx dedup (на случай ручной команды) ---
+def _cmd_job_key(name: str, chat_id: int) -> str:
+    return f"cmd::{name}::{chat_id}"
+
+def _cmd_is_running(context, key: str) -> bool:
+    jobs = context.bot_data.setdefault("cmd_jobs", {})
+    rec = jobs.get(key)
+    if not rec: return False
+    if time.time() - rec.get("ts", 0) > 600:
+        jobs.pop(key, None)
+        return False
+    return bool(rec.get("running"))
+
+def _cmd_start(context, key: str, msg_id: Optional[int] = None):
+    jobs = context.bot_data.setdefault("cmd_jobs", {})
+    jobs[key] = {"running": True, "ts": time.time(), "msg_id": msg_id}
+
+def _cmd_finish(context, key: str):
+    jobs = context.bot_data.setdefault("cmd_jobs", {})
     jobs.pop(key, None)
 
 # ---------- Post-OCR normalization: Latin look-alikes -> Cyrillic ----------
@@ -353,8 +379,13 @@ def _ocr_pdf_to_docx_layout(pdf_path: str, dpi: int, max_pages: int, _poppler_pa
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
     pages = list(range(total_pages))
+    # Ограничение страниц по умолчанию
     if max_pages and max_pages > 0:
         pages = pages[:max_pages]
+    else:
+        # Если max_pages=0 и документ длинный — ограничиваем дефолтной «крышкой»
+        if OCR_DEFAULT_CAP > 0:
+            pages = pages[:min(len(pages), OCR_DEFAULT_CAP)]
     paras_per_page: dict[int, list[str]] = {}
     ocr_needed = []
     for i in pages:
@@ -364,7 +395,9 @@ def _ocr_pdf_to_docx_layout(pdf_path: str, dpi: int, max_pages: int, _poppler_pa
         else:
             ocr_needed.append(i)
     if ocr_needed:
-        workers = min(os.cpu_count() or 4, 6)
+        # щадящая параллельность
+        cpu = os.cpu_count() or 4
+        workers = min(max(1, cpu // 2), 6)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_extract_or_ocr_page, doc, i, dpi, lang): i for i in ocr_needed}
             for fut in as_completed(futures):
@@ -684,37 +717,64 @@ def _get_last_pdf_doc(context) -> dict | None:
 
 # Новая команда: /pdf_to_docx
 async def pdf_to_docx(update: Update, context: Any):
-    rec = _get_last_pdf_doc(context)
-    if not rec:
-        await update.message.reply_text("Не найден загруженный PDF. Пришлите PDF-файл и повторите.")
+    # защита от повторных запусков
+    key = _cmd_job_key("pdf_to_docx", update.effective_chat.id)
+    if _cmd_is_running(context, key):
+        await update.message.reply_text("Команда /pdf_to_docx уже выполняется. Дождитесь завершения.")
         return
-    pdf_path = rec.get("path") or rec.get("pdf_processed") or ""
-    if not pdf_path or not os.path.isfile(pdf_path):
-        await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
-        return
+    msg = await update.message.reply_text("Запускаю конвертацию PDF → DOCX…")
+    _cmd_start(context, key, msg.message_id)
     try:
-        out_docx = _ocr_pdf_to_docx_layout(pdf_path, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка OCR/DOCX: {e!r}")
-        return
-    ok = await _send_document_with_retry(
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        file_path=out_docx,
-        filename=os.path.basename(out_docx),
-        caption="Готово: PDF → DOCX (OCR)."
-    )
-    if not ok:
-        if PUBLIC_BASE_URL:
-            url = f"{PUBLIC_BASE_URL.rstrip('/')}/{os.path.basename(out_docx)}"
-            await update.message.reply_text(
-                "Не удалось отправить файл из-за сетевого таймаута Telegram. "
-                f"Можно скачать по ссылке: {url}"
+        rec = _get_last_pdf_doc(context)
+        if not rec:
+            await update.message.reply_text("Не найден загруженный PDF. Пришлите PDF-файл и повторите.")
+            return
+        pdf_path = rec.get("path") or rec.get("pdf_processed") or ""
+        if not pdf_path or not os.path.isfile(pdf_path):
+            await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
+            return
+
+        # запускаем OCR с общим таймаутом
+        try:
+            out_docx = await asyncio.wait_for(
+                asyncio.to_thread(_ocr_pdf_to_docx_layout, pdf_path, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG),
+                timeout=OCR_OVERALL_TIMEOUT if OCR_OVERALL_TIMEOUT > 0 else None
             )
-        else:
-            await update.message.reply_text(
-                "Не удалось отправить файл из-за сетевого таймаута Telegram. Повторите команду позже."
+        except asyncio.TimeoutError:
+            await update.effective_chat.edit_message_text(
+                message_id=msg.message_id,
+                text=f"⏱️ Превышен лимит времени ({OCR_OVERALL_TIMEOUT}s) при конвертации. "
+                     f"Попробуйте уменьшить число страниц (OCR_MAX_PAGES) или повысить лимит OCR_OVERALL_TIMEOUT."
             )
+            return
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка OCR/DOCX: {e!r}")
+            return
+
+        ok = await _send_document_with_retry(
+            bot=context.bot,
+            chat_id=update.effective_chat.id,
+            file_path=out_docx,
+            filename=os.path.basename(out_docx),
+            caption="Готово: PDF → DOCX (OCR)."
+        )
+        try:
+            await update.effective_chat.edit_message_text(message_id=msg.message_id, text="Конвертация завершена.")
+        except Exception:
+            pass
+        if not ok:
+            if PUBLIC_BASE_URL:
+                url = f"{PUBLIC_BASE_URL.rstrip('/')}/{os.path.basename(out_docx)}"
+                await update.message.reply_text(
+                    "Не удалось отправить файл из-за сетевого таймаута Telegram. "
+                    f"Можно скачать по ссылке: {url}"
+                )
+            else:
+                await update.message.reply_text(
+                    "Не удалось отправить файл из-за сетевого таймаута Telegram. Повторите команду позже."
+                )
+    finally:
+        _cmd_finish(context, key)
 
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
@@ -756,7 +816,7 @@ async def doc_check(update: Update, context: Any):
     if not answer.strip() or answer.strip().startswith("⚠️"):
         answer = _fallback_check(last["text"])
     await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
-    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
+    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path[last['name']].stem}")
 
 async def doc_compare(update: Update, context: Any):
     """
