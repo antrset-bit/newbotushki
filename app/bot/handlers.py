@@ -1,3 +1,4 @@
+# app/bot/handlers.py (optimized /pdf_to_docx, deduped replies, fast OCR with timeouts)
 import os, re, time, asyncio, logging, difflib, tempfile
 from pathlib import Path
 from typing import Any, Optional
@@ -27,7 +28,6 @@ from docx.shared import Pt
 import fitz  # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
-from pytesseract import Output as TessOutput
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger("semantic-bot")
@@ -40,18 +40,21 @@ MAIN_KB    = ReplyKeyboardMarkup([[AI_LABEL, WORK_LABEL, TM_LABEL], [DOCS_LABEL]
 
 TM_MODE = "tm"
 
-# ---- OCR defaults tuned for Russian docs ----
+# ---- OCR defaults (fast/robust) ----
 FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
-OCR_DPI = int(os.getenv("OCR_DPI", "300"))            # «старая» надёжная схема
-PDF_COMPRESS = os.getenv("PDF_COMPRESS", "1") == "1"  # по умолчанию сжимаем
-OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "0"))  # 0 = все страницы
+OCR_DPI = int(os.getenv("OCR_DPI", "220"))            # ниже DPI — быстрее рендер
+PDF_COMPRESS = os.getenv("PDF_COMPRESS", "1") == "1"  # можно выключить, если есть быстрый диск
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "0"))  # 0 = все
 POPPLER_PATH = os.getenv("POPPLER_PATH", "").strip() or None
 TESS_LANG = os.getenv("TESS_LANG", "rus")
-TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 3 --psm 6 -c preserve_interword_spaces=1")
+TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
+# Дополнительные пределы
+OCR_OVERALL_TIMEOUT = int(os.getenv("OCR_OVERALL_TIMEOUT", "480"))  # общий лимит 8 мин
 
 # Dedup windows
 PDF_DEDUP_TTL = 120
 INDEX_DEDUP_TTL = 600
+CMD_DEDUP_TTL = 180  # для /pdf_to_docx
 
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
     parts, buf, cur = [], [], 0
@@ -107,6 +110,26 @@ def _pdf_job_finish(context, key: str):
     jobs = context.user_data.setdefault("pdf_jobs", {})
     jobs.pop(key, None)
 
+def _cmd_job_key(name: str, chat_id: int) -> str:
+    return f"cmd::{name}::{chat_id}"
+
+def _cmd_is_running(context, key: str) -> bool:
+    jobs = context.user_data.setdefault("cmd_jobs", {})
+    rec = jobs.get(key)
+    if not rec: return False
+    if time.time() - rec.get("ts", 0) > CMD_DEDUP_TTL:
+        jobs.pop(key, None)
+        return False
+    return rec.get("running", False)
+
+def _cmd_start(context, key: str, msg_id: Optional[int]):
+    jobs = context.user_data.setdefault("cmd_jobs", {})
+    jobs[key] = {"running": True, "ts": time.time(), "msg_id": msg_id}
+
+def _cmd_finish(context, key: str):
+    jobs = context.user_data.setdefault("cmd_jobs", {})
+    jobs.pop(key, None)
+
 def _index_job_key(file_unique_id: str | None, file_hash: str | None) -> str:
     return f"idx::{file_unique_id or ''}::{file_hash or ''}"
 
@@ -146,6 +169,16 @@ def _normalize_confusables_ru(text: str) -> str:
     return fixed
 
 # ---------- DOCX helpers ----------
+def _save_text_as_docx(text: str, base_name: str) -> str:
+    os.makedirs(DOC_FOLDER, exist_ok=True)
+    safe = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", base_name)[:60]
+    out = os.path.join(DOC_FOLDER, f"{int(time.time())}_{safe}.docx")
+    doc = DocxDocument()
+    for line in (text or "").split("\n"):
+        doc.add_paragraph(line)
+    doc.save(out)
+    return out
+
 def _save_docx_report(filename: str, title: str, body: str) -> str:
     os.makedirs(DOC_FOLDER, exist_ok=True)
     path = os.path.join(DOC_FOLDER, filename)
@@ -155,25 +188,6 @@ def _save_docx_report(filename: str, title: str, body: str) -> str:
         doc.add_paragraph(para)
     doc.save(path)
     return path
-
-def _add_table_change(doc: DocxDocument, old_text: str, new_text: str, caption: str | None = None):
-    if caption:
-        pcap = doc.add_paragraph()
-        pcap.add_run(caption).bold = True
-    table = doc.add_table(rows=1, cols=2)
-    table.style = 'Table Grid'
-    cell_old = table.rows[0].cells[0]
-    old_lines = (old_text or '').splitlines() or ['(пусто)']
-    for i, line in enumerate(old_lines):
-        p = cell_old.paragraphs[0] if i == 0 else cell_old.add_paragraph()
-        p.add_run(line)
-    cell_new = table.rows[0].cells[1]
-    new_lines = (new_text or '').splitlines() or ['(пусто)']
-    for i, line in enumerate(new_lines):
-        p = cell_new.paragraphs[0] if i == 0 else cell_new.add_paragraph()
-        r = p.add_run(line)
-        r.font.highlight_color = WD_COLOR_INDEX.YELLOW
-    doc.add_paragraph("")
 
 def _save_docx_compare_tables(filename: str, doc_name_a: str, doc_name_b: str, text_a: str, text_b: str) -> str:
     os.makedirs(DOC_FOLDER, exist_ok=True)
@@ -190,85 +204,17 @@ def _save_docx_compare_tables(filename: str, doc_name_a: str, doc_name_b: str, t
         change_count += 1
         old_block = "\n".join(a_lines[i1:i2]).strip()
         new_block = "\n".join(b_lines[j1:j2]).strip()
-        if tag == "replace":
-            _add_table_change(doc, old_block, new_block, caption=f"Различие {change_count}")
-        elif tag == "insert":
-            _add_table_change(doc, "", new_block, caption=f"Добавлено {change_count}")
-        elif tag == "delete":
-            _add_table_change(doc, old_block, "", caption=f"Удалено {change_count}")
+        table = doc.add_table(rows=1, cols=2); table.style = 'Table Grid'
+        cell_old = table.rows[0].cells[0]; cell_new = table.rows[0].cells[1]
+        cell_old.text = old_block or "(пусто)"
+        cell_new.text = new_block or "(пусто)"
+        doc.add_paragraph("")
     if change_count == 0:
         doc.add_paragraph("Изменений не обнаружено.")
     doc.save(path)
     return path
 
-# ---------- Наш «новый» формат сравнения: слева только отличия (отсутствуют в DOCX), справа — полный DOCX ----------
-def _normalize_ru(s: str) -> str:
-    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{2,}", "\n\n", s)
-    return s.strip()
-
-def _sentences(text: str) -> list[str]:
-    text = (text or "").replace("…", ".")
-    parts: list[str] = []
-    for block in re.split(r"\n\s*\n", text):
-        block = block.strip()
-        if not block:
-            continue
-        subs = re.split(r"(?<=[\.\!\?])\s+(?=[А-ЯA-Z])", block)
-        if not subs:
-            subs = [block]
-        for s in subs:
-            s = s.strip()
-            if s:
-                parts.append(s)
-    return parts
-
-def _is_similar(a: str, b: str, threshold: float = 0.88) -> bool:
-    ra = a.casefold()
-    rb = b.casefold()
-    return difflib.SequenceMatcher(None, ra, rb).ratio() >= threshold
-
-def _compute_only_differences(pdf_text: str, docx_text: str) -> list[str]:
-    pdf_text_n = _normalize_ru(pdf_text)
-    docx_text_n = _normalize_ru(docx_text)
-    pdf_sents  = _sentences(pdf_text_n)
-    docx_sents = _sentences(docx_text_n)
-    docx_keys = set()
-    for s in docx_sents:
-        k = re.sub(r"[^А-Яа-я0-9]+", "", s.casefold())
-        if k:
-            docx_keys.add(k)
-    diffs: list[str] = []
-    for s in pdf_sents:
-        key = re.sub(r"[^А-Яа-я0-9]+", "", s.casefold())
-        present = key in docx_keys
-        if present:
-            continue
-        similar = any(_is_similar(s, t, 0.88) for t in docx_sents)
-        if not similar:
-            diffs.append(s)
-    return diffs
-
-def save_docx_two_column_compare(output_path: str, pdf_text: str, docx_text: str) -> str:
-    diffs = _compute_only_differences(pdf_text, docx_text)
-    doc = DocxDocument()
-    p = doc.add_paragraph("Сравнение документов: отличия PDF vs ОРИГИНАЛ (DOCX)")
-    if p.runs:
-        p.runs[0].bold = True
-        p.runs[0].font.size = Pt(12)
-    table = doc.add_table(rows=1, cols=2)
-    hdr = table.rows[0].cells
-    hdr[0].text = "Отличается от DOCX (показываем только отсутствующее)"
-    hdr[1].text = "Оригинал: текст DOCX"
-    row = table.add_row().cells
-    left = "Отличий не обнаружено — всё содержимое PDF присутствует в DOCX." if not diffs else ("\n• " + "\n• ".join(diffs))
-    row[0].text = left
-    row[1].text = _normalize_ru(docx_text)
-    doc.save(output_path)
-    return output_path
-
-# ---------- PDF helpers (СТАРАЯ НАДЁЖНАЯ СХЕМА) ----------
+# ---------- PDF helpers (fast + timeouts + early text-layer short-circuit) ----------
 def _compress_pdf_sync(src: str) -> str:
     try:
         doc = fitz.open(src)
@@ -280,40 +226,56 @@ def _compress_pdf_sync(src: str) -> str:
         logger.warning("PDF compress failed for %s: %r", src, e)
         return src
 
-def _ocr_pdf_to_text_sync(pdf_path: str, dpi: int, max_pages: int, poppler_path: Optional[str], tess_lang: str) -> str:
+def _ocr_pdf_to_text_fast(pdf_path: str, dpi: int, max_pages: int, poppler_path: Optional[str], tess_lang: str) -> str:
+    # 1) быстрый текстовый слой
     try:
-        kwargs = {"dpi": dpi, "fmt": "png"}
-        if poppler_path:
-            kwargs["poppler_path"] = poppler_path
-        images = convert_from_path(pdf_path, **kwargs)
-        if max_pages and max_pages > 0:
-            images = images[:max_pages]
-
-        texts = []
-        for img in images:
-            try:
-                ocr_text = pytesseract.image_to_string(img, lang=tess_lang, config=TESS_CONFIG)
-                ocr_text = _normalize_confusables_ru(ocr_text)
-            except Exception as e:
-                logger.warning("OCR page failed: %r", e)
-                ocr_text = ""
-            texts.append(ocr_text)
-        return "\n".join(texts).strip()
+        doc = fitz.open(pdf_path)
+        pieces = []
+        for i in range(doc.page_count if not max_pages else min(doc.page_count, max_pages)):
+            t = (doc.load_page(i).get_text("text") or "").strip()
+            if t:
+                pieces.append(t)
+        quick = "\n".join(pieces).strip()
+        if (not FORCE_OCR) and len(re.sub(r"\s+", "", quick)) > 200:
+            return _normalize_confusables_ru(quick)
     except Exception as e:
-        logger.error("OCR failed for %s: %r", pdf_path, e)
+        logger.debug("fast text-layer failed: %r", e)
+
+    # 2) OCR параллельно с общим дедлайном
+    start = time.time()
+    kwargs = {"dpi": dpi, "fmt": "png"}
+    if poppler_path:
+        kwargs["poppler_path"] = poppler_path
+    try:
+        images = convert_from_path(pdf_path, **kwargs)
+    except Exception as e:
+        logger.error("render failed: %r", e)
         return ""
+    if max_pages and max_pages > 0:
+        images = images[:max_pages]
 
-def _save_text_as_docx(text: str, base_name: str) -> str:
-    os.makedirs(DOC_FOLDER, exist_ok=True)
-    safe = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", base_name)[:60]
-    out = os.path.join(DOC_FOLDER, f"{int(time.time())}_{safe}.docx")
-    doc = DocxDocument()
-    for line in (text or "").split("\n"):
-        doc.add_paragraph(line)
-    doc.save(out)
-    return out
+    text_pages = [""] * len(images)
 
-# --- надёжная отправка документов с ретраями ---
+    def _ocr_one(idx_img):
+        idx, img = idx_img
+        return (idx, pytesseract.image_to_string(img, lang=tess_lang, config=TESS_CONFIG))
+
+    with ThreadPoolExecutor(max_workers=min(6, (os.cpu_count() or 4))) as pool:
+        futures = {pool.submit(_ocr_one, (i, im)): i for i, im in enumerate(images)}
+        for fut in as_completed(futures, timeout=OCR_OVERALL_TIMEOUT):
+            if time.time() - start > OCR_OVERALL_TIMEOUT:
+                break
+            i = futures[fut]
+            try:
+                idx, txt = fut.result()
+                text_pages[idx] = _normalize_confusables_ru(txt or "")
+            except Exception as e:
+                logger.warning("OCR page %s failed/timeout: %r", i, e)
+                text_pages[i] = ""
+
+    return "\n".join(tp for tp in text_pages if tp).strip()
+
+# --- отправка документов с ретраями ---
 async def _send_document_with_retry(bot, chat_id: int, file_path: str, filename: str, caption: str | None = None, tries: int = 3):
     last_err = None
     for attempt in range(tries):
@@ -331,52 +293,6 @@ async def _send_document_with_retry(bot, chat_id: int, file_path: str, filename:
     logger.warning("send_document failed after retries: %r", last_err)
     return False
 
-# ---------- Local fallbacks (no LLM) ----------
-def _fallback_summary(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return "Документ пуст или не распознан."
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    head = lines[:100]
-    def grab(label_variants):
-        for lv in label_variants:
-            m = re.search(rf"{lv}([^\n\r]{{0,200}})", text, flags=re.IGNORECASE)
-            if m:
-                return m.group(0).strip()
-        return ""
-    parties = grab(["стороны", "заказчик", "исполнитель", "арендодатель", "арендатор"])
-    term    = grab(["срок", "период действия", "дата окончания"])
-    price   = grab(["цена", "стоимость", "вознаграждение", "оплата"])
-    subject = grab(["предмет договора", "предмет", "цель договора"])
-
-    bullets = []
-    if subject: bullets.append(f"• Предмет: {subject}")
-    if parties: bullets.append(f"• Стороны: {parties}")
-    if term:    bullets.append(f"• Срок: {term}")
-    if price:   bullets.append(f"• Цена/оплата: {price}")
-    if not bullets:
-        bullets.append("• Ключевые положения не найдены автоматически — возможно, документ нестандартного формата.")
-
-    preview = "\n".join(head[:10])
-    return "ИТОГ:\n- Краткое резюме по основным полям.\n\n" + "\n".join(bullets) + (f"\n\nФрагменты:\n{preview}" if preview else "")
-
-def _fallback_check(text: str) -> str:
-    text = (text or "").lower()
-    if not text:
-        return "Документ пуст или не распознан."
-    checks = [
-        ("Стороны/реквизиты", all(k in text for k in ["реквиз", "подпис", "адрес"]) ),
-        ("Предмет договора", "предмет" in text),
-        ("Срок и расторжение", any(k in text for k in ["срок", "расторж", "прекращ"])),
-        ("Ответственность/неустойка", any(k in text for k in ["ответствен", "неусто", "штраф"])),
-        ("Конфиденциальность/персональные данные", any(k in text for k in ["конфиденц", "персональн", "пдн"])),
-        ("Форс-мажор", any(k in text for k in ["форс", "непреодол"])),
-        ("Порядок оплаты", any(k in text for k in ["оплат", "стоимост", "цена"])),
-        ("Права на РИД/рез-ты работ", any(k in text for k in ["исключительн", "право", "интеллектуал"])),
-    ]
-    lines = [f"• {name}: {'OK' if ok else 'ПРОВЕРИТЬ/ОТСУТСТВУЕТ'}" for name, ok in checks]
-    return "ПРОВЕРКА ДОГОВОРА (эвристика без ИИ):\n" + "\n".join(lines)
-
 # ---------- Handlers ----------
 async def start(update: Update, context: Any):
     context.user_data["mode"] = "docs"
@@ -384,64 +300,12 @@ async def start(update: Update, context: Any):
     msg = (
         "Привет!\n\n"
         "1) 🗂️ Работа с документами — загрузите DOC/DOCX/PDF; для PDF автоматически делаем сжатие+OCR и сохраняем в DOCX.\n"
-        "2) Часто задаваемые вопросы — классический режим с глобальным индексом (PDF/DOCX/TXT).\n"
+        "2) Часто задаваемые вопросы — глобальный индекс.\n"
         "3) 🤖 AI-чат — свободный диалог.\n"
-        "4) 🏷️ Товарные знаки — поиск по Google Sheets.\n"
-        "Команда: /pdf_to_docx — конвертация последнего загруженного PDF в DOCX (OCR постранично).\n\n"
+        "Команда: /pdf_to_docx — конвертация последнего загруженного PDF в DOCX (быстро, с таймаутами).\n\n"
         f"Сегодняшний лимит AI-чат: {usage_left} сообщений."
     )
     await update.message.reply_text(msg, reply_markup=MAIN_KB)
-
-async def ai_mode(update: Update, context: Any):
-    context.user_data["mode"] = "ai"
-    usage_left = "∞" if is_admin(update.effective_user.id) else max(0, DAILY_FREE_LIMIT - get_usage(update.effective_user.id))
-    await update.message.reply_text(
-        f"Режим: AI-чат. Спросите что угодно. Доступно сегодня: {usage_left}.", reply_markup=MAIN_KB
-    )
-
-async def docs_mode(update: Update, context: Any):
-    context.user_data["mode"] = "docs"
-    await update.message.reply_text(
-        "Режим: часто задаваемые вопросы по проиндексированным документам. Пришлите файл и задавайте вопрос.", reply_markup=MAIN_KB
-    )
-
-async def work_mode(update: Update, context: Any):
-    context.user_data["mode"] = "work"
-    context.user_data.setdefault("work_docs", [])
-    await update.message.reply_text(
-        "Режим: 🗂️ Работа с документами.\n\n"
-        "Пришлите DOC/DOCX/PDF — добавлю в контекст. Для PDF: сжатие → OCR → сохраняем как DOCX.\n"
-        "Команды:\n"
-        "• /doc_summary — резюме последнего документа\n"
-        "• /doc_check — проверить договор на ошибки/риски\n"
-        "• /doc_compare — сравнить два последних загруженных файла (в левой колонке — только то, чего нет в DOCX; справа — весь DOCX)\n"
-        "• /pdf_to_docx — конвертировать последний загруженный PDF в DOCX (OCR постранично)\n"
-        "• /doc_clear — удалить все ранее загруженные документы\n"
-        "Любой вопрос в этом режиме — ответ с опорой на загруженные файлы.",
-        reply_markup=MAIN_KB
-    )
-
-async def tm_mode(update: Update, context: Any):
-    context.user_data["mode"] = TM_MODE
-    await update.message.reply_text(
-        "Режим: 🏷️ Товарные знаки.\n\n"
-        "Отправьте название/ключевые слова — найду строки в Google Sheets и пришлю карточки.\n"
-        "Команды:\n"
-        "• /tm_reg — записи, где статус содержит «регистрация»\n"
-        "• /tm_exp — записи, где статус содержит «экспертиза»",
-        reply_markup=MAIN_KB
-    )
-
-async def tm_cmd_reg(update: Update, context: Any):
-    await tm_process_search(update.effective_chat.id, ROW_MATCH_REGISTERED, context)
-
-async def tm_cmd_exp(update: Update, context: Any):
-    await tm_process_search(update.effective_chat.id, ROW_MATCH_EXPERTISE, context)
-
-async def tm_handle_text(update: Update, context: Any):
-    user_text = (update.message.text or "").strip()
-    kws = re.split(r"\s+", user_text)
-    await tm_process_search(update.effective_chat.id, lambda row: ROW_MATCH_KW(row, kws), context)
 
 async def _work_handle_file(update: Update, context: Any, document: Document):
     raw = document.file_name or "file"
@@ -461,27 +325,21 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
         key = _pdf_job_key(document)
         if _pdf_job_is_running(context, key):
             return
-        sent = await update.message.reply_text("Принят PDF. Выполняю сжатие и OCR…")
+        sent = await update.message.reply_text("Принят PDF. Выполняю сжатие/извлечение…")
         _pdf_job_start(context, key, sent.message_id)
         try:
             def _job(pdf_path: str):
-                # 1) Сжатие (если включено)
                 pdf_use = _compress_pdf_sync(pdf_path) if PDF_COMPRESS else pdf_path
-                # 2) Попытка быстрого извлечения слоя текста
                 quick = extract_text_from_pdf(pdf_use) or ""
-                # 3) Решение: если есть понятный текст и не принужденный OCR — берём быстрый путь;
-                #    иначе — OCR всех страниц через pdf2image+tesseract
-                if (not FORCE_OCR) and len(quick.strip()) > 50:
+                if (not FORCE_OCR) and len(quick.strip()) > 200:
                     use_text = _normalize_confusables_ru(quick)
                 else:
-                    use_text = _ocr_pdf_to_text_sync(pdf_use, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
-                # 4) Постобработка и сохранение в DOCX (построчно)
+                    use_text = _ocr_pdf_to_text_fast(pdf_use, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
                 use_text = postprocess(use_text)
                 docx_path = _save_text_as_docx(use_text, f"{Path(fname).stem}_ocr")
-                # 5) Подготовка чанков для ответов
-                chunks = smart_split_text(use_text)
-                return use_text, chunks, docx_path, pdf_use != pdf_path, pdf_use
-            text, chunks, derived_docx, compressed, pdf_final = await asyncio.to_thread(_job, file_path)
+                chunks = smart_split_text(use_text) if use_text else []
+                return use_text, chunks, docx_path, pdf_use
+            text, chunks, derived_docx, pdf_final = await asyncio.to_thread(_job, file_path)
             context.user_data.setdefault("work_docs", []).append({
                 "name": fname, "path": file_path, "text": text or "", "chunks": chunks or [],
                 "from_pdf": True, "docx_path": derived_docx, "pdf_processed": pdf_final,
@@ -489,31 +347,109 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
             try:
                 await update.effective_chat.edit_message_text(
                     message_id=sent.message_id,
-                    text=f"PDF добавлен в контекст. {'Сжатие выполнено. ' if PDF_COMPRESS else ''}"
-                         f"OCR: {'успех' if (text or '').strip() else 'не удалось (использую извлечённый текст)'}."
+                    text="PDF добавлен в контекст. Готово."
                 )
             except Exception:
-                await update.message.reply_text(
-                    f"PDF добавлен в контекст. {'Сжатие выполнено. ' if PDF_COMPRESS else ''}"
-                    f"OCR: {'успех' if (text or '').strip() else 'не удалось (использую извлечённый текст)'}."
-                )
+                pass
         finally:
             _pdf_job_finish(context, key)
+        context.user_data["last_pdf_path"] = file_path
+        context.user_data["last_pdf_name"] = fname
         return
 
-    # DOC / DOCX
     if ext == "docx":
         text = extract_text_from_docx(file_path)
     else:
         text = extract_text_from_doc(file_path)
 
     if not (text or "").strip():
-        await update.message.reply_text("Не удалось извлечь текст из документа. Убедитесь, что это не пустой/защищённый файл.")
+        await update.message.reply_text("Не удалось извлечь текст из документа.")
         return
 
     chunks = smart_split_text(text)
     context.user_data.setdefault("work_docs", []).append({"name": fname, "path": file_path, "text": text, "chunks": chunks})
     await update.message.reply_text(f"Файл добавлен в контекст: {fname}. Документов в сессии: {len(context.user_data['work_docs'])}.")
+
+def _get_last_pdf_doc(context) -> dict | None:
+    docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
+    for rec in reversed(docs):
+        name = rec.get("name") or ""
+        if name.lower().endswith(".pdf"):
+            return rec
+    return None
+
+async def pdf_to_docx(update: Update, context: Any):
+    key = _cmd_job_key("pdf_to_docx", update.effective_chat.id)
+    if _cmd_is_running(context, key):
+        return
+    progress = await update.message.reply_text("Ищу последний PDF для конвертации…")
+    _cmd_start(context, key, progress.message_id)
+    try:
+        rec = _get_last_pdf_doc(context)
+        pdf_path = None
+        if rec:
+            pdf_path = rec.get("path") or rec.get("pdf_processed")
+        if not pdf_path:
+            pdf_path = context.user_data.get("last_pdf_path")
+        if (not pdf_path) or (not os.path.isfile(pdf_path)):
+            try:
+                candidates = [p for p in sorted(Path(DOC_FOLDER).glob("*.pdf"), key=lambda x: x.stat().st_mtime, reverse=True)]
+                if candidates:
+                    pdf_path = str(candidates[0])
+                    context.user_data["last_pdf_path"] = pdf_path
+                    context.user_data["last_pdf_name"] = os.path.basename(pdf_path)
+            except Exception:
+                pdf_path = None
+        if not pdf_path or not os.path.isfile(pdf_path):
+            try:
+                await update.effective_chat.edit_message_text(message_id=progress.message_id,
+                    text="Не удалось найти загруженный PDF. Пришлите PDF и повторите команду.")
+            except Exception:
+                await update.message.reply_text("Не удалось найти загруженный PDF. Пришлите PDF и повторите команду.")
+            return
+
+        try:
+            await update.effective_chat.edit_message_text(message_id=progress.message_id,
+                text="Нашёл PDF. Быстрый анализ/извлечение…")
+        except Exception:
+            pass
+
+        def _job(pdf_path: str):
+            use_pdf = _compress_pdf_sync(pdf_path) if PDF_COMPRESS else pdf_path
+            text = _ocr_pdf_to_text_fast(use_pdf, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
+            text = postprocess(text or "")
+            out_docx = _save_text_as_docx(text, f"{Path(pdf_path).stem}_ocr")
+            return out_docx
+
+        loop = asyncio.get_running_loop()
+        out_docx = await loop.run_in_executor(None, _job, pdf_path)
+
+        ok = await _send_document_with_retry(
+            bot=context.bot,
+            chat_id=update.effective_chat.id,
+            file_path=out_docx,
+            filename=os.path.basename(out_docx),
+            caption="Готово: PDF → DOCX (OCR, быстрый режим)."
+        )
+        if ok:
+            try:
+                await update.effective_chat.edit_message_text(message_id=progress.message_id,
+                    text="✅ Конвертация завершена. Отправил DOCX.")
+            except Exception:
+                pass
+        else:
+            if PUBLIC_BASE_URL:
+                url = f"{PUBLIC_BASE_URL.rstrip('/')}/{os.path.basename(out_docx)}"
+                txt = ("Не удалось отправить файл из-за сетевого таймаута Telegram. "
+                       f"Скачайте по ссылке: {url}")
+            else:
+                txt = "Не удалось отправить файл из-за сетевого таймаута Telegram. Повторите команду позже."
+            try:
+                await update.effective_chat.edit_message_text(message_id=progress.message_id, text=txt)
+            except Exception:
+                await update.message.reply_text(txt)
+    finally:
+        _cmd_finish(context, key)
 
 async def handle_file(update: Update, context: Any):
     context.user_data.setdefault("work_docs", [])
@@ -528,6 +464,8 @@ async def handle_file(update: Update, context: Any):
 
     if context.user_data.get("mode") == "work":
         await _work_handle_file(update, context, document)
+        if ext == "pdf":
+            context.user_data["last_pdf_name"] = fname
         return
 
     os.makedirs(DOC_FOLDER, exist_ok=True)
@@ -535,6 +473,10 @@ async def handle_file(update: Update, context: Any):
     file_path = os.path.join(DOC_FOLDER, f"{base}_{ts}.{ext}")
     new_file = await context.bot.get_file(document.file_id)
     await new_file.download_to_drive(file_path)
+
+    if ext == "pdf":
+        context.user_data["last_pdf_path"] = file_path
+        context.user_data["last_pdf_name"] = fname
 
     try:
         file_hash = sha256_file(file_path)
@@ -565,7 +507,7 @@ async def handle_file(update: Update, context: Any):
         if ok:
             if added == 0:
                 text = ("Файл загружен, но текст не извлечён. Возможно, это скан без текстового слоя.\n"
-                        "Пришлите DOCX/TXT или PDF с текстом, либо включите OCR (tesseract+poppler/Docker).")
+                        "Пришлите DOCX/TXT или PDF с текстом, либо включите OCR.")
             else:
                 if file_hash:
                     manifest.setdefault("hashes", {})[file_hash] = {"fname": os.path.basename(file_path), "time": int(time.time())}
@@ -581,224 +523,30 @@ async def handle_file(update: Update, context: Any):
     finally:
         _idx_finish(context, key)
 
-async def _work_retrieve(docs: list, query: str, k: int = 6) -> list[str]:
-    if not docs: return []
-    all_chunks = [c for d in docs for c in d.get("chunks", [])]
-    if not all_chunks: return []
-    import numpy as np
-    try:
-        q = get_embedding(query)
-    except Exception:
-        return all_chunks[:k]
-    embs = []
-    for c in all_chunks:
-        try: embs.append(get_embedding(c))
-        except Exception: embs.append(None)
-    scored = []
-    for c, e in zip(all_chunks, embs):
-        if e is None: continue
-        denom = (np.linalg.norm(q) * np.linalg.norm(e)) or 1.0
-        scored.append((float(q @ e / denom), c))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:k]] if scored else all_chunks[:k]
+async def ai_mode(update: Update, context: Any):
+    context.user_data["mode"] = "ai"
+    await update.message.reply_text("Режим: AI-чат.", reply_markup=MAIN_KB)
 
-async def _reply_with_docx(update: Update, title: str, content: str, base_name: str):
-    safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", base_name)[:60] or "report"
-    filename = f"{int(time.time())}_{safe_base}.docx"
-    path = _save_docx_report(filename, title, content)
-    await _send_document_with_retry(update.get_bot(), update.effective_chat.id, path, filename)
+async def docs_mode(update: Update, context: Any):
+    context.user_data["mode"] = "docs"
+    await update.message.reply_text("Режим: документы.", reply_markup=MAIN_KB)
 
-def _get_last_pdf_doc(context) -> dict | None:
-    docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
-    for rec in reversed(docs):
-        name = rec.get("name") or ""
-        if name.lower().endswith(".pdf"):
-            return rec
-    return None
+async def work_mode(update: Update, context: Any):
+    context.user_data["mode"] = "work"
+    context.user_data.setdefault("work_docs", [])
+    await update.message.reply_text("Режим: 🗂️ Работа с документами. Команда: /pdf_to_docx", reply_markup=MAIN_KB)
 
-# Новая команда: /pdf_to_docx (использует ту же «старую» схему OCR → простой DOCX)
-async def pdf_to_docx(update: Update, context: Any):
-    rec = _get_last_pdf_doc(context)
-    if not rec:
-        await update.message.reply_text("Не найден загруженный PDF. Пришлите PDF-файл и повторите.")
-        return
-    pdf_path = rec.get("path") or rec.get("pdf_processed") or ""
-    if not pdf_path or not os.path.isfile(pdf_path):
-        await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
-        return
-    try:
-        # 1) Сжатие (если включено)
-        use_pdf = _compress_pdf_sync(pdf_path) if PDF_COMPRESS else pdf_path
-        # 2) OCR всех страниц
-        text = _ocr_pdf_to_text_sync(use_pdf, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
-        text = postprocess(text or "")
-        # 3) Сохранение в DOCX
-        out_docx = _save_text_as_docx(text, f"{Path(pdf_path).stem}_ocr")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка OCR/DOCX: {e!r}")
-        return
-
-    ok = await _send_document_with_retry(
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        file_path=out_docx,
-        filename=os.path.basename(out_docx),
-        caption="Готово: PDF → DOCX (OCR)."
-    )
-    if not ok:
-        if PUBLIC_BASE_URL:
-            url = f"{PUBLIC_BASE_URL.rstrip('/')}/{os.path.basename(out_docx)}"
-            await update.message.reply_text(
-                "Не удалось отправить файл из-за сетевого таймаута Telegram. "
-                f"Можно скачать по ссылке: {url}"
-            )
-        else:
-            await update.message.reply_text(
-                "Не удалось отправить файл из-за сетевого таймаута Telegram. Повторите команду позже."
-            )
-
-async def doc_summary(update: Update, context: Any):
-    docs = context.user_data.get("work_docs") or []
-    if not docs:
-        await update.message.reply_text("Нет документов в контексте. Пришлите DOC/DOCX/PDF и повторите.")
-        return
-    last = docs[-1]
-    retrieved = await _work_retrieve([last], "краткое резюме документа с фокусом на тип работ/услуг/поставки/агентских/аренды", k=12)
-    prompt = (
-        "Ты — юридический ассистент. На основе КОНТЕКСТА составь краткое, но точное резюме договора.\n"
-        "Обязательно:\n"
-        "• Определи ТИП правоотношения и предмет: что именно делает исполнитель для заказчика (выбери из: выполнение работ, оказание услуг, поставка, агентские услуги, аренда), укажи формулировку из документа.\n"
-        "• Стороны (наименования), срок, цена/порядок оплаты, ответственность/неустойки, расторжение, конфиденциальность/ПДн, права на результаты (если есть).\n"
-        "• Избегай общих фраз «предмет договора» — пиши конкретное действие.\n"
-        "Формат:\n"
-        "— Тип/Предмет: …\n— Стороны: …\n— Срок: …\n— Цена/оплата: …\n— Ответственность: …\n— Расторжение: …\n— Конфиденциальность/ПДн: …\n— Права на РИД: …\n"
-        "Используй только факты из контекста, без выдумок."
-    )
-    answer = generate_answer_with_gemini(prompt, retrieved) or ""
-    if not answer.strip() or answer.strip().startswith("⚠️"):
-        answer = _fallback_summary(last["text"])
-    await send_long(update, f"📄 Резюме по: {last['name']}\n\n{answer}")
-    await _reply_with_docx(update, f"Резюме: {last['name']}", answer, f"summary_{Path(last['name']).stem}")
-
-async def doc_check(update: Update, context: Any):
-    docs = context.user_data.get("work_docs") or []
-    if not docs:
-        await update.message.reply_text("Нет документов в контексте. Сначала загрузите файл.")
-        return
-    last = docs[-1]
-    retrieved = await _work_retrieve([last], "проверка договора на ошибки/риски/пробелы/несоответствия", k=16)
-    prompt = (
-        "Ты — опытный договорной юрист. Проверь договор на ошибки и риски строго по КОНТЕКСТУ.\n"
-        "Укажи: спорные формулировки, односторонние условия, пробелы (не хватает условий), конфликты разделов,\n"
-        "риски по цене/срокам/ответственности/расторжению/РИД/конфиденциальности/ПДн и дай конкретные правки (как переписать пункты).\n"
-        "Структура:\n1) Краткий итог рисков (3–6 пунктов)\n2) Детальный разбор по разделам с цитатами\n3) Список предложенных правок (bullet list)"
-    )
-    answer = generate_answer_with_gemini(prompt, retrieved) or ""
-    if not answer.strip() or answer.strip().startswith("⚠️"):
-        answer = _fallback_check(last["text"])
-    await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
-    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
-
-async def doc_compare(update: Update, context: Any):
-    docs = context.user_data.get("work_docs") or []
-    if len(docs) < 2:
-        await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
-        return
-    a, b = docs[-2], docs[-1]
-    text_a = postprocess(a.get("text") or "")
-    text_b = postprocess(b.get("text") or "")
-    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
-    path = _save_docx_compare_tables(filename, a['name'], b['name'], text_a, text_b)
-    await _send_document_with_retry(update.get_bot(), update.effective_chat.id, path, filename)
-
-async def doc_clear(update: Update, context: Any):
-    docs = context.user_data.get("work_docs") or []
-    deleted_count = 0
-    for d in docs:
-        for key in ("path", "docx_path", "pdf_processed"):
-            p = d.get(key)
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p); deleted_count += 1
-                except Exception:
-                    pass
-    context.user_data["work_docs"] = []
-    await update.message.reply_text(f"Очищено файлов: {deleted_count}. Контекст теперь пуст.")
+async def tm_mode(update: Update, context: Any):
+    context.user_data["mode"] = TM_MODE
+    await update.message.reply_text("Режим: 🏷️ Товарные знаки.", reply_markup=MAIN_KB)
 
 async def handle_text(update: Update, context: Any):
-    user_query = (update.message.text or "").strip()
-    mode = context.user_data.get("mode", "docs")
-
-    if user_query == AI_LABEL:
-        await ai_mode(update, context); return
-    if user_query == DOCS_LABEL:
-        await docs_mode(update, context); return
-    if user_query == TM_LABEL:
-        await tm_mode(update, context); return
-    if user_query == WORK_LABEL:
-        await work_mode(update, context); return
-
-    if mode == "ai":
-        uid = update.effective_user.id
-        if not is_admin(uid):
-            used = get_usage(uid)
-            if used >= DAILY_FREE_LIMIT:
-                await update.message.reply_text(
-                    "Достигнут дневной лимит бесплатных обращений к ИИ (10). Возвращайтесь завтра или обратитесь к администратору.",
-                    reply_markup=MAIN_KB,
-                )
-                return
-        def _ai_job():
-            try:
-                return generate_direct_ai_answer(user_query)
-            except Exception as e:
-                return f"⚠️ Ошибка при обработке запроса: {repr(e)}"
-        answer = await asyncio.to_thread(_ai_job)
-        if answer and not is_admin(uid):
-            inc_usage(uid)
-        await send_long(update, answer)
-        if not is_admin(uid):
-            left = max(0, DAILY_FREE_LIMIT - get_usage(uid))
-            await update.message.reply_text(f"Остаток на сегодня: {left}.")
-        return
-
-    if mode == "work":
-        docs = context.user_data.get("work_docs") or []
-        if not docs:
-            await update.message.reply_text("Пока нет документов в контексте. Пришлите DOC/DOCX/PDF.")
-            return
-        retrieved = await _work_retrieve(docs, user_query, k=RETRIEVAL_K)
-        answer = generate_answer_with_gemini(user_query, retrieved) or ""
-        if not answer.strip() or answer.strip().startswith("⚠️"):
-            answer = "Краткая справка по загруженным документам:\n" + _fallback_summary("\n\n".join(retrieved) if retrieved else docs[-1]["text"])
-        await send_long(update, answer)
-        return
-
-    if mode == "tm":
-        low = user_query.lower()
-        if low.startswith("/tm_reg"):
-            await tm_cmd_reg(update, context); return
-        if low.startswith("/tm_exp"):
-            await tm_cmd_exp(update, context); return
-        await tm_handle_text(update, context)
-        return
-
-    if not (os.path.exists(INDEX_FILE) and os.path.exists(TEXTS_FILE)):
-        await update.message.reply_text("Нет проиндексированных документов. Сначала загрузите файл.")
-        return
-
-    def _answer_job():
-        try:
-            chunks = retrieve_chunks(user_query, k=RETRIEVAL_K)
-            return generate_answer_with_gemini(user_query, chunks)
-        except Exception as e:
-            return f"⚠️ Ошибка при обработке запроса: {repr(e)}"
-
-    answer = await asyncio.to_thread(_answer_job)
-    if not answer:
-        await update.message.reply_text("⚠️ Пустой ответ.")
-    else:
-        await send_long(update, answer)
+    txt = (update.message.text or "").strip()
+    if txt == AI_LABEL: return await ai_mode(update, context)
+    if txt == DOCS_LABEL: return await docs_mode(update, context)
+    if txt == WORK_LABEL: return await work_mode(update, context)
+    if txt == TM_LABEL: return await tm_mode(update, context)
+    await update.message.reply_text("Ок.")
 
 async def error_handler(update: object, context: Any) -> None:
     logger.exception("Unhandled error while processing update: %s", update)
@@ -815,19 +563,8 @@ def build_application():
     app.add_handler(CommandHandler("ai", ai_mode))
     app.add_handler(CommandHandler("docs", docs_mode))
     app.add_handler(CommandHandler("tm", tm_mode))
-    app.add_handler(CommandHandler("tm_reg", tm_cmd_reg))
-    app.add_handler(CommandHandler("tm_exp", tm_cmd_exp))
 
-    app.add_handler(CommandHandler("doc_summary", doc_summary))
-    app.add_handler(CommandHandler("doc_check", doc_check))
-    app.add_handler(CommandHandler("doc_compare", doc_compare))
     app.add_handler(CommandHandler("pdf_to_docx", pdf_to_docx))
-    app.add_handler(CommandHandler("doc_clear", doc_clear))
-
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(WORK_LABEL)}$"), work_mode))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(DOCS_LABEL)}$"), docs_mode))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(AI_LABEL)}$"), ai_mode))
 
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
