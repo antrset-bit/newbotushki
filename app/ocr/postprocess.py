@@ -94,7 +94,7 @@ EXTENDED_MAP.update({
     "u": "и",
     "l": "л",
     "j": "й",
-    "Z": "З", "z": "з",
+    "Z": "З", "z": "з", "J": "Д", "j": "д", "h": "н", "q": "д",
 })
 
 def _map_token_if_mixed(token: str) -> str:
@@ -107,6 +107,71 @@ def _map_token_if_mixed(token: str) -> str:
 
 def _fix_mixed_words(text: str) -> str:
     return re.sub(r"[A-Za-z\u0400-\u04FF]+", lambda m: _map_token_if_mixed(m.group(0)), text)
+
+
+
+
+# --- Дополнительные агрессивные правки под юр-документы ---
+
+# Частые юридические фразы и заголовки (разные «ломаные» варианты -> каноничная форма)
+CANON_RULES = [
+    # Договор
+    (re.compile(r"(?i)\bJ[ji]оrо[vvb]ор\b"), "Договор"),
+    (re.compile(r"(?i)\bJ[ji]оrо[vvb]ор[а-яA-Za-z]*"), "Договор"),
+    # Исполнитель / Заказчик
+    (re.compile(r"(?i)\bUсnоmm?m?r?e?nb\b"), "Исполнитель"),
+    (re.compile(r"(?i)\b3аkа3[ui]n?k\b"), "Заказчик"),
+    # Автономная некоммерческая организация
+    (re.compile(r"(?i)АВТОНОМН[Аа][Ss]?\s+Н[еe]КОММ[еe]р[чс][еe]с[кk][аa][яy]\s+ОРГАНИЗАЦИ[Яя]"), "АВТОНОМНАЯ НЕКОММЕРЧЕСКАЯ ОРГАНИЗАЦИЯ"),
+    # Приложение № 1 (и подобные)
+    (re.compile(r"(?i)Прилож[еe]н[иi][еe]\s+N[еe°º]"), "Приложение № "),
+    # Сторона / Стороны
+    (re.compile(r"(?i)С[тt]ор[оo]н[аa]"), "Сторона"),
+    (re.compile(r"(?i)С[тt]ор[оo]н[ыy]"), "Стороны"),
+]
+
+def _apply_canon_rules(text: str) -> str:
+    for pat, repl in CANON_RULES:
+        text = pat.sub(repl, text)
+    return text
+
+def _legal_specific_normalize(text: str) -> str:
+    # № из OCR: Nе, N° , Nº, Nо → №
+    text = re.sub(r"\bN[еe°ºoO]\b", "№", text)
+    # r. → г.  (год/город); 2025r. → 2025 г.
+    text = re.sub(r"\br\.\s*", "г. ", text)
+    text = re.sub(r"(\d{4})\s*r\.", r"\1 г.", text)
+    # Окончания типа "ая" и "ий" ломаются как 'aS'/'iй' — починим распространённый случай
+    text = re.sub(r"([А-Яа-я])[aA][sS]\b", r"\1ая", text)  # ...аS → ...ая
+    # двойные дефисы/равно после нормализации
+    text = re.sub(r"\s*=\s*", " ", text)
+    return text
+
+
+
+
+# --- Финальная стадия: только кириллица (по запросу пользователя) ---
+
+# Используем расширенную карту если есть, иначе базовую
+try:
+    _FINAL_MAP = str.maketrans(EXTENDED_MAP)  # type: ignore
+except NameError:
+    _FINAL_MAP = BASE_MAP  # type: ignore
+
+_ALLOWED_PUNCT = r",\.\:\;\!\?\-—–\(\)\[\]\{\}«»\"'\/\\\%\@\#\&\*\+\=\_<>\|\^~`"  # что оставляем кроме букв/цифр и пробелов
+
+def _force_cyrillic_only(text: str) -> str:
+    # 1) максимально транслитерируем латиницу в кириллицу
+    text = text.translate(_FINAL_MAP)
+    # 2) удаляем оставшиеся латинские буквы целиком
+    text = re.sub(r"[A-Za-z]", "", text)
+    # 3) приводим множественные пробелы
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # 4) убираем пробелы перед знаками препинания
+    text = re.sub(r"\s+([{}])".format(_ALLOWED_PUNCT), r"\1", text)
+    # 5) нормализуем переносы
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def postprocess(text: str) -> str:
@@ -123,5 +188,8 @@ def postprocess(text: str) -> str:
     text = _apply_base_map(text)
     text = _apply_context_rules(text)
     text = _apply_regex_rules(text)
+    text = _legal_specific_normalize(text)
+    text = _apply_canon_rules(text)
     text = _tidy_spaces(text)
+    text = _force_cyrillic_only(text)
     return text
