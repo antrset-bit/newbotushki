@@ -19,6 +19,8 @@ from app.services.tm import tm_process_search, ROW_MATCH_EXPERTISE, ROW_MATCH_RE
 from app.services.extract import extract_text_from_pdf, extract_text_from_docx, extract_text_from_txt, extract_text_from_doc
 from app.services.chunking import smart_split_text
 from app.services.embeddings import get_embedding
+import io
+import tempfile
 from app.ocr.postprocess import postprocess
 
 from docx import Document as DocxDocument
@@ -396,7 +398,7 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
             def _job(pdf_path: str):
                 pdf_use = _compress_pdf_sync(pdf_path) if PDF_COMPRESS else pdf_path
                 quick = extract_text_from_pdf(pdf_use) or ""
-                if len(quick.strip()) > 50:
+                if (not FORCE_OCR) and len(quick.strip()) > 50:
                     use_text = _normalize_confusables_ru(quick)
                 else:
                     use_text = _ocr_pdf_to_text_sync(pdf_use, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
@@ -533,6 +535,60 @@ async def _reply_with_docx(update: Update, title: str, content: str, base_name: 
     path = _save_docx_report(filename, title, content)
     with open(path, "rb") as f:
         await update.message.reply_document(InputFile(f, filename=filename))
+
+
+def _get_last_pdf_doc(context) -> dict | None:
+    """Возвращает последний загруженный документ из work_docs/general с расширением .pdf"""
+    docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
+    for rec in reversed(docs):
+        name = rec.get("name") or ""
+        if name.lower().endswith(".pdf"):
+            return rec
+    return None
+
+
+
+async def pdf_to_txt(update: Update, context: Any):
+    """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
+    rec = _get_last_pdf_doc(context)
+    if not rec:
+        await update.message.reply_text("Не найден загруженный PDF. Пришлите PDF-файл и повторите.")
+        return
+    text = (rec.get("text") or "").strip()
+    if len(text) < 10:
+        try:
+            pdf_path = rec.get("path") or rec.get("pdf_processed") or ""
+            if not pdf_path:
+                await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
+                return
+            from app.services.extract import extract_text_from_pdf
+            text = extract_text_from_pdf(pdf_path)
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка извлечения текста: {e!r}")
+            return
+    try:
+        text = postprocess(text or "")
+    except Exception:
+        pass
+    if not (text or "").strip():
+        await update.message.reply_text("Текст не распознан. Убедитесь, что PDF читабелен.")
+        return
+    safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (rec.get("name") or "document"))[:60]
+    filename = f"{int(time.time())}_{safe_base}.txt"
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(text)
+        tmp.flush()
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: PDF → TXT")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
 
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
@@ -693,6 +749,7 @@ def build_application():
     app.add_handler(CommandHandler("doc_summary", doc_summary))
     app.add_handler(CommandHandler("doc_check", doc_check))
     app.add_handler(CommandHandler("doc_compare", doc_compare))
+    app.add_handler(CommandHandler("pdf_to_txt", pdf_to_txt))
     app.add_handler(CommandHandler("doc_clear", doc_clear))
 
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
