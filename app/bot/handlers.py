@@ -19,6 +19,7 @@ from app.services.tm import tm_process_search, ROW_MATCH_EXPERTISE, ROW_MATCH_RE
 from app.services.extract import extract_text_from_pdf, extract_text_from_docx, extract_text_from_txt, extract_text_from_doc
 from app.services.chunking import smart_split_text
 from app.services.embeddings import get_embedding
+from app.ocr.postprocess import postprocess
 
 from docx import Document as DocxDocument
 from docx.enum.text import WD_COLOR_INDEX
@@ -399,6 +400,7 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
                     use_text = _normalize_confusables_ru(quick)
                 else:
                     use_text = _ocr_pdf_to_text_sync(pdf_use, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
+                use_text = postprocess(use_text)
                 docx_path = _save_text_as_docx(use_text, f"{Path(fname).stem}_ocr")
                 chunks = smart_split_text(use_text)
                 return use_text, chunks, docx_path, pdf_use != pdf_path, pdf_use
