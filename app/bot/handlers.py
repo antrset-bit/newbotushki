@@ -818,7 +818,7 @@ async def doc_check(update: Update, context: Any):
     if not answer.strip() or answer.strip().startswith("⚠️"):
         answer = _fallback_check(last["text"])
     await send_long(update, f"🔎 Проверка договора: {last['name']}\\n\\n{answer}")
-    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path[last['name']).stem}")
+    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
 async def doc_compare(update: Update, context: Any):
     """
