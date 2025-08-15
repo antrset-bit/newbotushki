@@ -1,5 +1,3 @@
-# (same as the "updated_ocr_handlers.zip" version I prepared earlier)
-# Included here in full for convenience.
 import os, re, time, asyncio, logging, difflib
 from pathlib import Path
 from typing import Any, Optional
@@ -19,19 +17,20 @@ from app.services.tm import tm_process_search, ROW_MATCH_EXPERTISE, ROW_MATCH_RE
 from app.services.extract import extract_text_from_pdf, extract_text_from_docx, extract_text_from_txt, extract_text_from_doc
 from app.services.chunking import smart_split_text
 from app.services.embeddings import get_embedding
-import io
-import tempfile
 from app.ocr.postprocess import postprocess
 
 from docx import Document as DocxDocument
 from docx.enum.text import WD_COLOR_INDEX
-from docx.shared import Pt  # для форматирования заголовка в сравнении
+from docx.shared import Pt
 
 FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
 
+import io
+import tempfile
 import fitz  # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
+from pytesseract import Output as TessOutput
 
 logger = logging.getLogger("semantic-bot")
 
@@ -39,8 +38,8 @@ AI_LABEL   = "🤖 AI-чат"
 DOCS_LABEL = "Часто задаваемые вопросы"
 WORK_LABEL = "🗂️ Работа с документами"
 TM_LABEL   = "🏷️ Товарные знаки"
-PDF2TXT_LABEL = "📝 PDF → TXT"  # новая кнопка
-MAIN_KB    = ReplyKeyboardMarkup([[AI_LABEL, WORK_LABEL, TM_LABEL], [DOCS_LABEL, PDF2TXT_LABEL]], resize_keyboard=True)
+# Кнопку PDF→TXT удалили. Главное меню без неё:
+MAIN_KB    = ReplyKeyboardMarkup([[AI_LABEL, WORK_LABEL, TM_LABEL], [DOCS_LABEL]], resize_keyboard=True)
 
 TM_MODE = "tm"
 
@@ -206,7 +205,7 @@ def _save_text_as_docx(text: str, base_name: str) -> str:
     doc.save(out)
     return out
 
-# ---------- DOCX helpers (стандартный отчёт изменений построчно — оставляем как было) ----------
+# ---------- DOCX helpers (старое построчное сравнение — оставляем) ----------
 def _save_docx_report(filename: str, title: str, body: str) -> str:
     os.makedirs(DOC_FOLDER, exist_ok=True)
     path = os.path.join(DOC_FOLDER, filename)
@@ -298,8 +297,7 @@ def _is_similar(a: str, b: str, threshold: float = 0.88) -> bool:
 
 def _compute_only_differences(pdf_text: str, docx_text: str) -> list[str]:
     """
-    Возвращаем только те фрагменты из PDF, которых «нет» в DOCX
-    (независимо от позиции в документе).
+    Возвращаем только те фрагменты из PDF, которых «нет» в DOCX (независимо от позиции).
     """
     pdf_text_n = _normalize_ru(pdf_text)
     docx_text_n = _normalize_ru(docx_text)
@@ -345,15 +343,75 @@ def save_docx_two_column_compare(output_path: str, pdf_text: str, docx_text: str
     hdr[1].text = "Оригинал: текст DOCX"
 
     row = table.add_row().cells
-    if diffs:
-        left = "\n• " + "\n• ".join(diffs)
-    else:
-        left = "Отличий не обнаружено — всё содержимое PDF присутствует в DOCX."
+    left = "Отличий не обнаружено — всё содержимое PDF присутствует в DOCX." if not diffs else ("\n• " + "\n• ".join(diffs))
     row[0].text = left
     row[1].text = _normalize_ru(docx_text)
 
     doc.save(output_path)
     return output_path
+
+# ---------- OCR → DOCX с сохранением порядка (по блокам/абзацам/строкам Tesseract) ----------
+def _ocr_pdf_to_docx_layout(pdf_path: str, dpi: int, max_pages: int, poppler_path: Optional[str], lang: str) -> str:
+    """
+    Делает OCR по всем страницам PDF и собирает DOCX, сохраняя порядок:
+    сортировка по (block_num, par_num, line_num, left).
+    Между страницами — разрыв страницы.
+    """
+    kwargs = {"dpi": dpi, "fmt": "png"}
+    if poppler_path:
+        kwargs["poppler_path"] = poppler_path
+    images = convert_from_path(pdf_path, **kwargs)
+    if max_pages and max_pages > 0:
+        images = images[:max_pages]
+
+    doc = DocxDocument()
+    for page_idx, img in enumerate(images, start=1):
+        try:
+            data = pytesseract.image_to_data(img, lang=lang, config=TESS_CONFIG, output_type=TessOutput.DICT)
+        except Exception as e:
+            logger.warning("image_to_data failed on page %s: %r", page_idx, e)
+            data = None
+
+        if not data or not data.get("text"):
+            # fallback на простой OCR
+            try:
+                page_text = pytesseract.image_to_string(img, lang=lang, config=TESS_CONFIG)
+            except Exception:
+                page_text = ""
+            page_text = postprocess(_normalize_confusables_ru(page_text))
+            for line in page_text.splitlines():
+                doc.add_paragraph(line)
+        else:
+            n = len(data["text"])
+            lines: dict[tuple[int,int,int], list[tuple[int,str]]] = {}
+            for i in range(n):
+                txt = (data["text"][i] or "").strip()
+                conf = int(data.get("conf", ["-1"]*n)[i]) if str(data.get("conf", ["-1"]*n)[i]).isdigit() else -1
+                if not txt or conf < 0:
+                    continue
+                b = int(data.get("block_num", [0]*n)[i] or 0)
+                p = int(data.get("par_num",   [0]*n)[i] or 0)
+                l = int(data.get("line_num",  [0]*n)[i] or 0)
+                x = int(data.get("left",      [0]*n)[i] or 0)
+                key = (b, p, l)
+                lines.setdefault(key, []).append((x, txt))
+
+            # порядок чтения: блок→абзац→строка; внутри строки — по левому краю
+            for key in sorted(lines.keys()):
+                words = sorted(lines[key], key=lambda t: t[0])
+                line_text = " ".join(w for _, w in words)
+                line_text = postprocess(_normalize_confusables_ru(line_text))
+                doc.add_paragraph(line_text)
+
+        # разрыв страницы между страницами
+        if page_idx < len(images):
+            doc.add_page_break()
+
+    os.makedirs(DOC_FOLDER, exist_ok=True)
+    safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", Path(pdf_path).stem)[:60]
+    out_path = os.path.join(DOC_FOLDER, f"{int(time.time())}_{safe_base}_ocr.docx")
+    doc.save(out_path)
+    return out_path
 
 # ---------- Local fallbacks (no LLM) ----------
 def _fallback_summary(text: str) -> str:
@@ -411,7 +469,7 @@ async def start(update: Update, context: Any):
         "2) Часто задаваемые вопросы — классический режим с глобальным индексом (PDF/DOCX/TXT).\n"
         "3) 🤖 AI-чат — свободный диалог.\n"
         "4) 🏷️ Товарные знаки — поиск по Google Sheets.\n"
-        "5) 📝 PDF → TXT — конвертация последнего загруженного PDF в текстовый файл.\n\n"
+        "Команда: /pdf_to_docx — конвертация последнего загруженного PDF в DOCX (OCR с сохранением порядка).\n\n"
         f"Сегодняшний лимит AI-чат: {usage_left} сообщений."
     )
     await update.message.reply_text(msg, reply_markup=MAIN_KB)
@@ -439,7 +497,7 @@ async def work_mode(update: Update, context: Any):
         "• /doc_summary — резюме последнего документа\n"
         "• /doc_check — проверить договор на ошибки/риски\n"
         "• /doc_compare — сравнить два последних загруженных файла (в левой колонке — только то, чего нет в DOCX; справа — весь DOCX)\n"
-        "• /pdf_to_txt — конвертировать последний загруженный PDF в TXT\n"
+        "• /pdf_to_docx — конвертировать последний загруженный PDF в DOCX (OCR с сохранением порядка)\n"
         "• /doc_clear — удалить все ранее загруженные документы\n"
         "Любой вопрос в этом режиме — ответ с опорой на загруженные файлы.",
         reply_markup=MAIN_KB
@@ -629,7 +687,6 @@ async def _reply_with_docx(update: Update, title: str, content: str, base_name: 
     with open(path, "rb") as f:
         await update.message.reply_document(InputFile(f, filename=filename))
 
-
 def _get_last_pdf_doc(context) -> dict | None:
     """Возвращает последний загруженный документ из work_docs/general с расширением .pdf"""
     docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
@@ -639,46 +696,27 @@ def _get_last_pdf_doc(context) -> dict | None:
             return rec
     return None
 
-async def pdf_to_txt(update: Update, context: Any):
-    """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
+# Новая команда: /pdf_to_docx (ранее была /pdf_to_txt)
+async def pdf_to_docx(update: Update, context: Any):
+    """OCR PDF → DOCX с сохранением порядка строк."""
     rec = _get_last_pdf_doc(context)
     if not rec:
         await update.message.reply_text("Не найден загруженный PDF. Пришлите PDF-файл и повторите.")
         return
-    text = (rec.get("text") or "").strip()
-    if len(text) < 10:
-        try:
-            pdf_path = rec.get("path") or rec.get("pdf_processed") or ""
-            if not pdf_path:
-                await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
-                return
-            from app.services.extract import extract_text_from_pdf
-            text = extract_text_from_pdf(pdf_path)
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка извлечения текста: {e!r}")
-            return
-    try:
-        text = postprocess(text or "")
-    except Exception:
-        pass
-    if not (text or "").strip():
-        await update.message.reply_text("Текст не распознан. Убедитесь, что PDF читабелен.")
+
+    pdf_path = rec.get("path") or rec.get("pdf_processed") or ""
+    if not pdf_path or not os.path.isfile(pdf_path):
+        await update.message.reply_text("Не удалось определить путь к PDF. Пришлите файл ещё раз.")
         return
-    safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (rec.get("name") or "document"))[:60]
-    filename = f"{int(time.time())}_{safe_base}.txt"
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-        tmp.write(text)
-        tmp.flush()
-        tmp_path = tmp.name
+
     try:
-        with open(tmp_path, "rb") as f:
-            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: PDF → TXT")
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        out_docx = _ocr_pdf_to_docx_layout(pdf_path, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка OCR/DOCX: {e!r}")
+        return
+
+    with open(out_docx, "rb") as f:
+        await update.message.reply_document(InputFile(f, filename=os.path.basename(out_docx)), caption="Готово: PDF → DOCX (OCR).")
 
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
@@ -720,7 +758,7 @@ async def doc_check(update: Update, context: Any):
     if not answer.strip() or answer.strip().startswith("⚠️"):
         answer = _fallback_check(last["text"])
     await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
-    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")  # noqa: E999
+    await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
 async def doc_compare(update: Update, context: Any):
     """
@@ -792,8 +830,7 @@ async def handle_text(update: Update, context: Any):
         await tm_mode(update, context); return
     if user_query == WORK_LABEL:
         await work_mode(update, context); return
-    if user_query == PDF2TXT_LABEL:
-        await pdf_to_txt(update, context); return
+    # Кнопки для /pdf_to_txt больше нет — вызов только командой /pdf_to_docx
 
     if mode == "ai":
         uid = update.effective_user.id
@@ -872,13 +909,12 @@ def build_application():
     app.add_handler(CommandHandler("doc_summary", doc_summary))
     app.add_handler(CommandHandler("doc_check", doc_check))
     app.add_handler(CommandHandler("doc_compare", doc_compare))
-    app.add_handler(CommandHandler("pdf_to_txt", pdf_to_txt))
+    app.add_handler(CommandHandler("pdf_to_docx", pdf_to_docx))  # новая команда
     app.add_handler(CommandHandler("doc_clear", doc_clear))
 
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(WORK_LABEL)}$"), work_mode))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(DOCS_LABEL)}$"), docs_mode))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(PDF2TXT_LABEL)}$"), pdf_to_txt))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(AI_LABEL)}$"), ai_mode))
 
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
