@@ -26,6 +26,8 @@ from app.ocr.postprocess import postprocess
 from docx import Document as DocxDocument
 from docx.enum.text import WD_COLOR_INDEX
 
+FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
+
 import fitz  # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
