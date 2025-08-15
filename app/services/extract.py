@@ -5,6 +5,7 @@ import pytesseract
 from docx import Document as DocxDocument
 
 logger = logging.getLogger("semantic-bot")
+from app.ocr.postprocess import postprocess
 
 def extract_text_from_pdf(file_path: str) -> str:
     # Сначала PyMuPDF, если пусто — OCR через tesseract
@@ -13,7 +14,7 @@ def extract_text_from_pdf(file_path: str) -> str:
         pages_text = [page.get_text().strip() for page in doc]
         text = "\n".join(pages_text).strip()
         if text:
-            return text
+            return postprocess(text)
     except Exception as e:
         logger.warning("PyMuPDF не смог извлечь текст (%s). Переходим к OCR.", repr(e))
     try:
