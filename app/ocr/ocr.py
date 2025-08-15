@@ -12,6 +12,7 @@ from app.config import (
     DOC_FOLDER, OCR_DPI, OCR_MAX_PAGES, POPPLER_PATH, TESS_LANG, TESS_CONFIG, PDF_COMPRESS
 )
 from app.services.llm_clean import clean_with_gemini
+from app.ocr.postprocess import postprocess
 
 logger = logging.getLogger("semantic-bot")
 
@@ -56,13 +57,28 @@ def map_and_strip_latin(text: str) -> str:
 def normalize_text(text: str) -> str:
     if not text:
         return text
-    text = re.sub(r"(?:(?<=\s)|^)N\s*(?=\d)", "№", text)     # N -> №
+    # Замена N123 на №123
+    text = re.sub(r"(?:(?<=\s)|^)N\s*(?=\d)", "№", text)
+    # Приводим дефисы к единому виду
     text = text.replace("—", "-").replace("–", "-").replace("−", "-")
-    text = BAD_EQ_RE.sub(" ", text)
-    text = SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
-    text = MULTI_DOTS_RE.sub("...", text)
+    # Убираем лишние знаки равенства вокруг текста
+    text = re.sub(r"\s*={2,}\s*", " ", text)
+    # Убираем пробел перед пунктуацией
+    text = re.sub(r"\s+([,.:;!?%])", r"\1", text)
+    # Сжимаем многоточия
+    text = re.sub(r"\.{3,}", "...", text)
+    # Удаляем мусор в виде подряд идущих не букв/цифр
+    text = re.sub(r"[^\w\sА-Яа-яЁё.,:;!?()№\-]{2,}", " ", text)
+    # Маппинг латиницы в кириллицу
     text = map_and_strip_latin(text)
+    # Убираем повторяющиеся пробелы
+    text = re.sub(r"[ \t]+", " ", text)
+    # Убираем пробелы в начале/конце строк
+    text = "\n".join(line.strip() for line in text.splitlines())
+    # Убираем пустые строки в начале/конце и лишние переносы
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
 
 def deskew_and_binarize(img):
     try:
@@ -156,6 +172,7 @@ def ocr_file(path: str) -> Tuple[str, str]:
     use_pdf = compress_pdf(path)
     raw_text = ocr_pdf_to_text(use_pdf)
     text = normalize_text(raw_text)
+    text = postprocess(text)
     if USE_GEMINI_NORMALIZE and (text or "").strip():
         text = clean_with_gemini(text, max_chars=6000, temperature=0.1)
     docx_path = save_text_as_docx(text, Path(path).stem + "_ocr")
