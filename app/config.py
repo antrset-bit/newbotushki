@@ -108,3 +108,4 @@ PDF_COMPRESS   = (_env("PDF_COMPRESS") or "1") == "1"
 POPPLER_PATH   = (_env("POPPLER_PATH") or "").strip() or None
 TESS_LANG      = _env("TESS_LANG") or "rus"
 TESS_CONFIG    = _env("TESS_CONFIG") or "--oem 3 --psm 6 -c preserve_interword_spaces=1"
+FORCE_OCR = os.getenv("FORCE_OCR", "0") == "1"
