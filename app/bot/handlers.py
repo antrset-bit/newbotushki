@@ -9,7 +9,8 @@ from telegram.ext import MessageHandler, CommandHandler, filters, ApplicationBui
 
 from app.config import (
     TELEGRAM_BOT_TOKEN, DOC_FOLDER, INDEX_FILE, TEXTS_FILE, MANIFEST_FILE,
-    DAILY_FREE_LIMIT, TELEGRAM_MSG_LIMIT, RUN_MODE, PUBLIC_BASE_URL, RETRIEVAL_K
+    DAILY_FREE_LIMIT, TELEGRAM_MSG_LIMIT, RUN_MODE, PUBLIC_BASE_URL, RETRIEVAL_K,
+    FORCE_OCR
 )
 from app.utils.usage import is_admin, get_usage, inc_usage
 from app.utils.files import load_manifest, save_manifest, sha256_file
