@@ -548,7 +548,7 @@ def _get_last_pdf_doc(context) -> dict | None:
 
 
 
-async async def pdf_to_txt(update: Update, context: Any):
+async def pdf_to_txt(update: Update, context: Any):
     """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
     rec = _get_last_pdf_doc(context)
     if not rec:
