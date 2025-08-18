@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: semantic-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TEXT_MODEL_NAME
+        value: gemini-2.5-flash
+      - key: EMBEDDING_MODEL
+        value: gemini-embedding-001
+      - key: RUN_MODE
+        value: webhook
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: DAILY_FREE_LIMIT
+        value: "10"
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: DOC_FOLDER
+        value: /opt/render/project/src/data/documents
+      - key: FAISS_INDEX
+        value: /opt/render/project/src/data/index.faiss
+      - key: TEXTS_FILE
+        value: /opt/render/project/src/data/texts.pkl
+      - key: MANIFEST_FILE
+        value: /opt/render/project/src/data/manifest.json
+      - key: USAGE_FILE
+        value: /opt/render/project/src/data/usage.json
+      - key: DOCMETA_FILE
+        value: /opt/render/project/src/data/docmeta.json
+      - key: TM_ENABLE
+        value: "1"
+      - key: TM_SHEET_ID
+        sync: false
+      - key: TM_SHEET_NAME
+        value: "Лист1"
+      - key: TM_SHEET_GID
+        value: "0"
+      - key: TM_SHEET_CSV_URL
+        sync: false
+      - key: TM_DEBUG
+        value: "0"
