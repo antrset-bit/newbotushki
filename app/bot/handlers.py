@@ -575,26 +575,23 @@ async def pdf_to_docx(update: Update, context: Any):
         await update.message.reply_text("Текст не распознан. Убедитесь, что PDF читабелен.")
         return
     safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (rec.get("name") or "document"))[:60]
-    filename = f"{int(time.time())}_{safe_base}.txt"
+    filename = f"{int(time.time())}_{safe_base}.docx"
     import tempfile, os
     # Создаём временный DOCX и записываем текст
-import tempfile
-with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-    tmp_path = tmp.name
-try:
-    docx = DocxDocument()
-    for para in (text.split("\n") if text else [""]):
-        docx.add_paragraph(para)
-    docx.save(tmp_path)
-    filename = "converted.pdf.docx"
-    with open(tmp_path, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: PDF → DOCX")
-finally:
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
     try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
-
+        docx = DocxDocument()
+        for para in (text.split("\n") if text else [""]):
+            docx.add_paragraph(para)
+        docx.save(tmp_path)
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: PDF → DOCX")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
