@@ -1,3 +1,4 @@
+import json
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
 import os, re, time, asyncio, logging, difflib
@@ -625,10 +626,8 @@ async def pdf_to_txt(update: Update, context: Any):
             # Для надёжности режем на куски, но сначала пытаемся целиком
             content = [
                 {"role": "user", "parts": [{"text": prompt}]},
-                {"role": "user", "parts": [{"text": f"ORIGINAL:
-{original_text}"}]},
-                {"role": "user", "parts": [{"text": f"RECOGNIZED:
-{recognized_text}"}]},
+                {"role": "user", "parts": [{"text": "ORIGINAL:\n{original_text}"}]},
+                {"role": "user", "parts": [{"text": "RECOGNIZED:\n{recognized_text}"}]},
             ]
             resp = await asyncio.to_thread(lambda: client.models.generate_content(
                 model="gemini-1.5-flash",
@@ -741,6 +740,60 @@ async def doc_to_compare(update: Update, context: Any):
         if tmp_path:
             try: os.remove(tmp_path)
             except Exception: pass
+
+
+
+async def _gemini_compare_mismatches(original_text: str, recognized_text: str, api_key: str | None) -> list[tuple[str, str]]:
+    """
+    Возвращает список пар (orig, rec) только для несовпадающих фрагментов.
+    Использует Gemini для «умного» выравнивания (терпит OCR-ошибки).
+    Если ключа нет/ошибка — возвращает пустой список (обработаем фоллбэком).
+    """
+    try:
+        if not api_key:
+            return []
+        client = genai.Client(api_key=api_key)
+        prompt = f"""Сравни два текста: ORIGINAL и RECOGNIZED.
+Тексты частично совпадают, распознанный содержит OCR-ошибки (вставки/пропуски/замены символов).
+Верни ТОЛЬКО JSON-массив объектов различий (без пояснений и без обрамления код-блоком).
+Каждый объект должен иметь вид:
+{{"original": "<фрагмент из ORIGINAL>", "recognized": "<соответствующий фрагмент из RECOGNIZED>"}}
+
+Важно:
+- Включай только несовпадающие фрагменты.
+- Старайся выравнивать по смыслу, а не по позиции.
+- Объединяй близкие мелкие правки в одну пару, если это повышает читаемость.
+
+ORIGINAL:
+{original_text}
+
+RECOGNIZED:
+{recognized_text}
+"""
+        def _call():
+            return client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                config={"response_mime_type": "application/json"}
+            )
+        resp = await asyncio.to_thread(_call)
+        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
+        data = json.loads(raw) if raw else []
+        pairs: list[tuple[str, str]] = []
+        if isinstance(data, dict) and "items" in data:
+            data = data.get("items") or []
+        if isinstance(data, list):
+            for item in data:
+                try:
+                    o = (item.get("original") or "").strip()
+                    r = (item.get("recognized") or "").strip()
+                    if o and r and o != r:
+                        pairs.append((o, r))
+                except Exception:
+                    continue
+        return pairs[:500]
+    except Exception:
+        return []
 
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
