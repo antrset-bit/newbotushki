@@ -1,4 +1,3 @@
-import json
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
 import os, re, time, asyncio, logging, difflib
@@ -7,8 +6,6 @@ from typing import Any, Optional
 
 from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
 from telegram.ext import MessageHandler, CommandHandler, filters, ApplicationBuilder
-
-from google import genai
 
 from app.config import (
     TELEGRAM_BOT_TOKEN, DOC_FOLDER, INDEX_FILE, TEXTS_FILE, MANIFEST_FILE,
@@ -550,17 +547,6 @@ def _get_last_pdf_doc(context) -> dict | None:
             return rec
     return None
 
-def _get_last_docx_doc(context) -> dict | None:
-    """Возвращает последний загруженный документ с расширением .docx из work_docs/docs."""
-    docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
-    for rec in reversed(docs):
-        name = (rec.get("name") or "").lower()
-        if name.endswith(".docx"):
-            return rec
-    return None
-
-
-
 
 
 async def pdf_to_txt(update: Update, context: Any):
@@ -605,196 +591,6 @@ async def pdf_to_txt(update: Update, context: Any):
             pass
 
 
-
-
-    async def _gemini_compare_mismatches(original_text: str, recognized_text: str, api_key: str | None) -> list[tuple[str, str]]:
-        """
-        Возвращает список пар (orig, rec) только для несовпадающих фрагментов.
-        Использует Gemini для «умного» выравнивания (терпит OCR-ошибки).
-        Если ключа нет/ошибка — возвращает пустой список (обработаем запасным методом).
-        """
-        try:
-            if not api_key:
-                return []
-            client = genai.Client(api_key=api_key)
-            prompt = (
-                "Сравни два текста: ORIGINAL и RECOGNIZED. Тексты могут частично совпадать, "
-                "распознанный содержит OCR-ошибки. Верни JSON со списком объектов только для несовпадающих фрагментов. "
-                "Каждый объект: {original: <строка из ORIGINAL>, recognized: <соответствующий фрагмент из RECOGNIZED>} "
-                "Не добавляй пояснений, верни только JSON-массив."
-            )
-            # Для надёжности режем на куски, но сначала пытаемся целиком
-            content = [
-                {"role": "user", "parts": [{"text": prompt}]},
-                {"role": "user", "parts": [{"text": "ORIGINAL:\n{original_text}"}]},
-                {"role": "user", "parts": [{"text": "RECOGNIZED:\n{recognized_text}"}]},
-            ]
-            resp = await asyncio.to_thread(lambda: client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=content,
-                config={"response_mime_type": "application/json"}
-            ))
-            raw = resp.text if hasattr(resp, "text") else (resp.output_text if hasattr(resp, "output_text") else "")
-            data = json.loads(raw) if raw else []
-            pairs = []
-            for item in data:
-                o = (item.get("original") or "").strip()
-                r = (item.get("recognized") or "").strip()
-                if o and r and o != r:
-                    pairs.append((o, r))
-            return pairs[:500]
-        except Exception:
-            return []
-
-
-
-async def doc_to_compare(update: Update, context: Any):
-    """
-    Сравнивает распознанный текст последнего PDF с содержимым последнего загруженного DOCX.
-    Выдаёт DOCX с таблицей из двух колонок: Оригинал (DOCX) | Изменения (распознанный PDF).
-    Включаются только несовпадающие пары.
-    """
-    try:
-        from app.services.extract import extract_text_from_docx
-    except Exception:
-        await update.message.reply_text("Внутренняя ошибка: не удалось импортировать extract_text_from_docx.")
-        return
-
-    pdf_rec = _get_last_pdf_doc(context)
-    if not pdf_rec:
-        await update.message.reply_text("Не найден PDF для сравнения. Сначала загрузите PDF и получите распознанный текст.")
-        return
-    rec_text = (pdf_rec.get("text") or "").strip()
-    if not rec_text:
-        await update.message.reply_text("У PDF нет сохранённого текста. Сначала выполните распознавание (OCR).")
-        return
-
-    docx_rec = _get_last_docx_doc(context)
-    if not docx_rec:
-        await update.message.reply_text("Не найден DOCX. Загрузите оригинальный DOCX и повторите.")
-        return
-    orig_path = docx_rec.get("path") or ""
-    if not orig_path:
-        await update.message.reply_text("Не удалось получить путь к DOCX. Пришлите файл ещё раз.")
-        return
-
-    # 1) Получаем оригинальный текст из DOCX
-    try:
-        original_text = extract_text_from_docx(orig_path) or ""
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка чтения DOCX: {e!r}")
-        return
-    if not original_text.strip():
-        await update.message.reply_text("В DOCX не удалось прочитать текст (пустой).")
-        return
-
-    # 2) Умное сравнение через Gemini (если есть ключ)
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    pairs = await _gemini_compare_mismatches(original_text, rec_text, api_key)
-
-    # 3) Фоллбэк — простой diff по строкам, если Gemini не помог
-    if not pairs:
-        import difflib
-        orig_lines = [ln.strip() for ln in original_text.splitlines() if ln.strip()]
-        rec_lines  = [ln.strip() for ln in rec_text.splitlines() if ln.strip()]
-        sm = difflib.SequenceMatcher(a=orig_lines, b=rec_lines, autojunk=True)
-        pairs = []
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            o = " ".join(orig_lines[i1:i2]).strip()
-            r = " ".join(rec_lines[j1:j2]).strip()
-            if o and r and o != r:
-                pairs.append((o, r))
-        if not pairs:
-            await update.message.reply_text("Различий не найдено.")
-            return
-
-    # 4) Собираем DOCX-отчёт с таблицей
-    import tempfile
-    tmp_path = None
-    try:
-        doc = DocxDocument()
-        # Заголовок
-        doc.add_heading("Сравнение: Оригинал (DOCX) vs Распознанный (PDF OCR)", level=1)
-        table = doc.add_table(rows=1, cols=2)
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = "Оригинальный текст (DOCX)"
-        hdr_cells[1].text = "Изменения / Распознанный текст (PDF OCR)"
-        # Добавляем только несовпадающие пары
-        LIMIT = 300  # чтобы не разрастался отчёт
-        for (o, r) in pairs[:LIMIT]:
-            row = table.add_row().cells
-            row[0].text = o
-            row[1].text = r
-
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-            tmp_path = tmp.name
-        doc.save(tmp_path)
-
-        safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (docx_rec.get("name") or "original"))[:40]
-        filename = f"compare_{safe_base}.docx"
-        with open(tmp_path, "rb") as f:
-            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: сравнение в DOCX")
-    finally:
-        if tmp_path:
-            try: os.remove(tmp_path)
-            except Exception: pass
-
-
-
-async def _gemini_compare_mismatches(original_text: str, recognized_text: str, api_key: str | None) -> list[tuple[str, str]]:
-    """
-    Возвращает список пар (orig, rec) только для несовпадающих фрагментов.
-    Использует Gemini для «умного» выравнивания (терпит OCR-ошибки).
-    Если ключа нет/ошибка — возвращает пустой список (обработаем фоллбэком).
-    """
-    try:
-        if not api_key:
-            return []
-        client = genai.Client(api_key=api_key)
-        prompt = f"""Сравни два текста: ORIGINAL и RECOGNIZED.
-Тексты частично совпадают, распознанный содержит OCR-ошибки (вставки/пропуски/замены символов).
-Верни ТОЛЬКО JSON-массив объектов различий (без пояснений и без обрамления код-блоком).
-Каждый объект должен иметь вид:
-{{"original": "<фрагмент из ORIGINAL>", "recognized": "<соответствующий фрагмент из RECOGNIZED>"}}
-
-Важно:
-- Включай только несовпадающие фрагменты.
-- Старайся выравнивать по смыслу, а не по позиции.
-- Объединяй близкие мелкие правки в одну пару, если это повышает читаемость.
-
-ORIGINAL:
-{original_text}
-
-RECOGNIZED:
-{recognized_text}
-"""
-        def _call():
-            return client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=[{"role": "user", "parts": [{"text": prompt}]}],
-                config={"response_mime_type": "application/json"}
-            )
-        resp = await asyncio.to_thread(_call)
-        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
-        data = json.loads(raw) if raw else []
-        pairs: list[tuple[str, str]] = []
-        if isinstance(data, dict) and "items" in data:
-            data = data.get("items") or []
-        if isinstance(data, list):
-            for item in data:
-                try:
-                    o = (item.get("original") or "").strip()
-                    r = (item.get("recognized") or "").strip()
-                    if o and r and o != r:
-                        pairs.append((o, r))
-                except Exception:
-                    continue
-        return pairs[:500]
-    except Exception:
-        return []
-
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
     if not docs:
@@ -837,93 +633,18 @@ async def doc_check(update: Update, context: Any):
     await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
     await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
-
 async def doc_compare(update: Update, context: Any):
-    """
-    Сравнивает распознанный текст последнего PDF с содержимым последнего загруженного DOCX.
-    Отправляет DOCX с таблицей из двух колонок: Оригинальный текст (DOCX) | Изменения (распознанный PDF).
-    Включаются только несовпадающие пары. Используется Gemini для «умного» сопоставления (если есть API ключ).
-    """
-    try:
-        from app.services.extract import extract_text_from_docx
-    except Exception:
-        await update.message.reply_text("Внутренняя ошибка: не удалось импортировать extract_text_from_docx.")
+    docs = context.user_data.get("work_docs") or []
+    if len(docs) < 2:
+        await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
         return
-
-    pdf_rec = _get_last_pdf_doc(context)
-    if not pdf_rec:
-        await update.message.reply_text("Не найден PDF для сравнения. Сначала загрузите PDF и выполните распознавание.")
-        return
-    rec_text = (pdf_rec.get("text") or "").strip()
-    if not rec_text:
-        await update.message.reply_text("У PDF нет сохранённого текста. Сначала выполните распознавание (OCR).")
-        return
-
-    docx_rec = _get_last_docx_doc(context)
-    if not docx_rec:
-        await update.message.reply_text("Не найден DOCX. Загрузите оригинальный DOCX и повторите.")
-        return
-    orig_path = docx_rec.get("path") or ""
-    if not orig_path:
-        await update.message.reply_text("Не удалось получить путь к DOCX. Пришлите файл ещё раз.")
-        return
-
-    try:
-        original_text = extract_text_from_docx(orig_path) or ""
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка чтения DOCX: {e!r}")
-        return
-    if not original_text.strip():
-        await update.message.reply_text("В DOCX не удалось прочитать текст (пустой).")
-        return
-
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    pairs = await _gemini_compare_mismatches(original_text, rec_text, api_key)
-
-    if not pairs:
-        import difflib
-        orig_lines = [ln.strip() for ln in original_text.splitlines() if ln.strip()]
-        rec_lines  = [ln.strip() for ln in rec_text.splitlines() if ln.strip()]
-        sm = difflib.SequenceMatcher(a=orig_lines, b=rec_lines, autojunk=True)
-        pairs = []
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            o = " ".join(orig_lines[i1:i2]).strip()
-            r = " ".join(rec_lines[j1:j2]).strip()
-            if o and r and o != r:
-                pairs.append((o, r))
-        if not pairs:
-            await update.message.reply_text("Различий не найдено.")
-            return
-
-    import tempfile, re as _re2
-    tmp_path = None
-    try:
-        doc = DocxDocument()
-        doc.add_heading("Сравнение: Оригинал (DOCX) vs Распознанный (PDF OCR)", level=1)
-        table = doc.add_table(rows=1, cols=2)
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = "Оригинальный текст (DOCX)"
-        hdr_cells[1].text = "Изменения / Распознанный текст (PDF OCR)"
-        LIMIT = 300
-        for (o, r) in pairs[:LIMIT]:
-            row = table.add_row().cells
-            row[0].text = o
-            row[1].text = r
-
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-            tmp_path = tmp.name
-        doc.save(tmp_path)
-
-        safe_base = _re2.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (docx_rec.get("name") or "original"))[:40]
-        filename = f"compare_{safe_base}.docx"
-        with open(tmp_path, "rb") as f:
-            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: сравнение в DOCX")
-    finally:
-        if tmp_path:
-            try: os.remove(tmp_path)
-            except Exception: pass
+    a, b = docs[-2], docs[-1]
+    text_a = a.get("text") or ""
+    text_b = b.get("text") or ""
+    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
+    path = _save_docx_compare_tables(filename, a['name'], b['name'], text_a, text_b)
+    with open(path, "rb") as f:
+        await update.message.reply_document(InputFile(f, filename=filename))
 
 async def doc_clear(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
@@ -1029,7 +750,6 @@ def build_application():
     app.add_handler(CommandHandler("doc_summary", doc_summary))
     app.add_handler(CommandHandler("doc_check", doc_check))
     app.add_handler(CommandHandler("doc_compare", doc_compare))
-    app.add_handler(CommandHandler("doc_to_compare", doc_to_compare))
     app.add_handler(CommandHandler("pdf_to_txt", pdf_to_txt))
     app.add_handler(CommandHandler("doc_clear", doc_clear))
 
