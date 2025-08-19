@@ -583,8 +583,7 @@ with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
     tmp_path = tmp.name
 try:
     docx = DocxDocument()
-    for para in (text.split("
-") if text else [""]):
+    for para in (text.split("\n") if text else [""]):
         docx.add_paragraph(para)
     docx.save(tmp_path)
     filename = "converted.pdf.docx"
