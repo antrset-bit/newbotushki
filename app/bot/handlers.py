@@ -549,8 +549,8 @@ def _get_last_pdf_doc(context) -> dict | None:
 
 
 
-async def pdf_to_txt(update: Update, context: Any):
-    """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
+async def pdf_to_docx(update: Update, context: Any):
+    """Конвертирует последний загруженный PDF в DOCX и отправляет файл пользователю."""
     rec = _get_last_pdf_doc(context)
     if not rec:
         await update.message.reply_text("Не найден загруженный PDF. Пришлите PDF-файл и повторите.")
@@ -577,18 +577,24 @@ async def pdf_to_txt(update: Update, context: Any):
     safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (rec.get("name") or "document"))[:60]
     filename = f"{int(time.time())}_{safe_base}.txt"
     import tempfile, os
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-        tmp.write(text)
-        tmp.flush()
-        tmp_path = tmp.name
+    # Создаём временный DOCX и записываем текст
+import tempfile
+with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+    tmp_path = tmp.name
+try:
+    docx = DocxDocument()
+    for para in (text.split("
+") if text else [""]):
+        docx.add_paragraph(para)
+    docx.save(tmp_path)
+    filename = "converted.pdf.docx"
+    with open(tmp_path, "rb") as f:
+        await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: PDF → DOCX")
+finally:
     try:
-        with open(tmp_path, "rb") as f:
-            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: PDF → TXT")
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        os.remove(tmp_path)
+    except Exception:
+        pass
 
 
 async def doc_summary(update: Update, context: Any):
@@ -750,7 +756,7 @@ def build_application():
     app.add_handler(CommandHandler("doc_summary", doc_summary))
     app.add_handler(CommandHandler("doc_check", doc_check))
     app.add_handler(CommandHandler("doc_compare", doc_compare))
-    app.add_handler(CommandHandler("pdf_to_txt", pdf_to_txt))
+    app.add_handler(CommandHandler("pdf_to_docx", pdf_to_docx))
     app.add_handler(CommandHandler("doc_clear", doc_clear))
 
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
