@@ -56,6 +56,15 @@ INDEX_DEDUP_TTL = 600
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
     parts, buf, cur = [], [], 0
     for p in text.replace("\r\n", "\n").split("\n"):
+        if len(p) + cur > max_len:
+            parts.append("\n".join(buf))
+            buf, cur = [p], len(p)
+        else:
+            buf.append(p)
+            cur += len(p)
+    if buf:
+        parts.append("\n".join(buf))
+    return parts
 
 # --- Gemini API key presence check (one-time) ---
 GEMINI_KEY_CHECK_DONE = False
