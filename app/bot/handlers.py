@@ -613,16 +613,29 @@ async def doc_summary(update: Update, context: Any):
         return
     last = docs[-1]
     retrieved = await _work_retrieve([last], "краткое резюме документа с фокусом на тип работ/услуг/поставки/агентских/аренды", k=12)
+
+
+
     prompt = (
-        "Ты — юридический ассистент. На основе КОНТЕКСТА составь краткое, но точное резюме договора.\n"
-        "Обязательно:\n"
-        "• Определи ТИП правоотношения и предмет: что именно делает исполнитель для заказчика (выбери из: выполнение работ, оказание услуг, поставка, агентские услуги, аренда), укажи формулировку из документа.\n"
-        "• Стороны (наименования), срок, цена/порядок оплаты, ответственность/неустойки, расторжение, конфиденциальность/ПДн, права на результаты (если есть).\n"
-        "• Избегай общих фраз «предмет договора» — пиши конкретное действие.\n"
-        "Формат:\n"
-        "— Тип/Предмет: …\n— Стороны: …\n— Срок: …\n— Цена/оплата: …\n— Ответственность: …\n— Расторжение: …\n— Конфиденциальность/ПДн: …\n— Права на РИД: …\n"
-        "Используй только факты из контекста, без выдумок."
+        """Ты — юридический редактор. Даны пары предложений из договора.
+- ORIGINAL — из исходного DOCX
+- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
+
+Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
+Игнорируй различия в пробелах, регистре и пунктуации.
+Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
+
+Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
+{"original": "...", "recognized": "..."} — только для пар с СМЫСЛОВЫМ отличием.
+
+PAIRS:
+"""
+        + json.dumps(items, ensure_ascii=False)
     )
+
+
+
+
     answer = generate_answer_with_gemini(prompt, retrieved) or ""
     if not answer.strip() or answer.strip().startswith("⚠️"):
         answer = _fallback_summary(last["text"])
@@ -780,61 +793,8 @@ def build_application():
 
 
 
+
 async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
-    if not pairs:
-        return []
-    key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not key:
-        logging.getLogger("semantic-bot").info("[Gemini] API key missing — skip filtering")
-        return pairs
-    try:
-        logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        items = [{"original": o, "recognized": r} for (o, r) in pairs]
-        prompt = (
-            "Ты — юридический редактор. Даны пары предложений из договора.
-"
-            "- ORIGINAL — из исходного DOCX
-"
-            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
-
-"
-            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
-"
-            "Игнорируй различия в пробелах, регистре и пунктуации.
-"
-            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
-
-"
-            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
-"
-            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.
-
-"
-            "PAIRS:
-"
-            + json.dumps(items, ensure_ascii=False)
-        )
-        resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
-        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
-        data = json.loads(raw) if raw else []
-        out = []
-        if isinstance(data, list):
-            for item in data:
-                try:
-                    o = (item.get("original") or "").strip()
-                    r = (item.get("recognized") or "").strip()
-                    if o and r:
-                        out.append((o, r))
-                except Exception:
-                    continue
-        logging.getLogger("semantic-bot").info("[Gemini] filtered pairs: %s", len(out) if out else 0)
-        return out or pairs
-    except Exception as e:
-        logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
-        return pairs
-
     """
     Финальная фильтрация различий через Gemini.
     ЛОГИ:
@@ -850,31 +810,24 @@ async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
         return pairs
     try:
         logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
+        import google.generativeai as genai
         genai.configure(api_key=key)
         model = genai.GenerativeModel("gemini-1.5-flash")
         items = [{"original": o, "recognized": r} for (o, r) in pairs]
         prompt = (
-            "Ты — юридический редактор. Даны пары предложений из договора.
-"
-            "- ORIGINAL — из исходного DOCX
-"
-            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
+            """Ты — юридический редактор. Даны пары предложений из договора.
+- ORIGINAL — из исходного DOCX
+- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
 
-"
-            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
-"
-            "Игнорируй различия в пробелах, регистре и пунктуации.
-"
-            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
+Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
+Игнорируй различия в пробелах, регистре и пунктуации.
+Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
 
-"
-            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
-"
-            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.
+Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
+{"original": "...", "recognized": "..."} — только для пар с СМЫСЛОВЫМ отличием.
 
-"
-            "PAIRS:
-"
+PAIRS:
+"""
             + json.dumps(items, ensure_ascii=False)
         )
         resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
