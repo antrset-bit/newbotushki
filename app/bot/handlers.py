@@ -1,3 +1,5 @@
+import json
+import asyncio
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
 import os, re, time, asyncio, logging, difflib
@@ -6,6 +8,8 @@ from typing import Any, Optional
 
 from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
 from telegram.ext import MessageHandler, CommandHandler, filters, ApplicationBuilder
+
+from google import genai
 
 from app.config import (
     TELEGRAM_BOT_TOKEN, DOC_FOLDER, INDEX_FILE, TEXTS_FILE, MANIFEST_FILE,
@@ -591,6 +595,109 @@ async def pdf_to_txt(update: Update, context: Any):
             pass
 
 
+
+
+# === Helpers for semantic sentence comparison ===
+_PUNCT_RE = re.compile(r"[\s\u00A0\.,;:!\?\-–—\(\)\"'«»\[\]\{\}/~`@#$%^&*_+=|\\]+", re.UNICODE)
+
+_OCR_MAP = str.maketrans({
+    "O": "0", "o": "0", "О": "0",
+    "З": "3", "з": "3",
+    "I": "1", "l": "1", "і": "1",
+    "S": "5", "s": "5",
+    "B": "8",
+})
+
+def _normalize_meaning(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = _PUNCT_RE.sub("", s)
+    return s
+
+def _numbers_from_text(s: str):
+    if not s:
+        return []
+    t = s.translate(_OCR_MAP)
+    t = re.sub(r"(?<=\d)[\s\u00A0](?=\d)", "", t)
+    nums = re.findall(r"\d+(?:[.,]\d+)?", t)
+    return [x.replace(",", ".") for x in nums]
+
+def _sentences(text: str):
+    if not text:
+        return []
+    t = re.sub(r"[ \t]*\n[ \t]*", " ", text)
+    parts = re.split(r"(?<=[\.\?\!])\s+(?=[А-ЯA-Z0-9\(])", t)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > 300:
+            out.extend([x.strip() for x in re.split(r"(?<=; )|(?<=;)", p) if x and x.strip()])
+        else:
+            out.append(p)
+    return out
+
+def _align_sentence_pairs(orig_sents, rec_sents):
+    import difflib
+    on = [_normalize_meaning(x) for x in orig_sents]
+    rn = [_normalize_meaning(x) for x in rec_sents]
+    sm = difflib.SequenceMatcher(a=on, b=rn, autojunk=True)
+    pairs = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        o = " ".join(orig_sents[i1:i2]).strip()
+        r = " ".join(rec_sents[j1:j2]).strip()
+        if _normalize_meaning(o) == _normalize_meaning(r):
+            continue
+        pairs.append((o, r))
+    return pairs
+
+async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
+    if not pairs:
+        return []
+    if not api_key:
+        return pairs
+    try:
+        client = genai.Client(api_key=api_key)
+        items = [{"original": o, "recognized": r} for (o, r) in pairs]
+        prompt = """Ты — юридический редактор. Даны пары предложений из договора:
+- ORIGINAL — из исходного DOCX
+- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
+
+Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
+Игнорируй различия в пробелах, регистре и пунктуации.
+Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
+
+Верни ЧИСТЫЙ JSON-массив объектов без обрамления:
+{"original":"...","recognized":"..."} — только для пар с СМЫСЛОВЫМ отличием.
+
+PAIRS:
+""" + json.dumps(items, ensure_ascii=False)
+        def _call(pt):
+            return client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=[{"role": "user", "parts": [{"text": pt}]}],
+                config={"response_mime_type": "application/json"}
+            )
+        resp = await asyncio.to_thread(_call, prompt)
+        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
+        data = json.loads(raw) if raw else []
+        out = []
+        if isinstance(data, list):
+            for item in data:
+                try:
+                    o = (item.get("original") or "").strip()
+                    r = (item.get("recognized") or "").strip()
+                    if o and r:
+                        out.append((o, r))
+                except Exception:
+                    continue
+        return out or pairs
+    except Exception:
+        return pairs
 async def doc_summary(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
     if not docs:
@@ -633,18 +740,102 @@ async def doc_check(update: Update, context: Any):
     await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
     await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
+
 async def doc_compare(update: Update, context: Any):
-    docs = context.user_data.get("work_docs") or []
-    if len(docs) < 2:
-        await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
+    """
+    Сравнение по ПРЕДЛОЖЕНИЯМ: выводит только смысловые отличия.
+    Левая колонка — оригинал (DOCX), правая — различия (PDF OCR).
+    """
+    try:
+        from app.services.extract import extract_text_from_docx
+    except Exception:
+        await update.message.reply_text("Внутренняя ошибка: не удалось импортировать extract_text_from_docx.")
         return
-    a, b = docs[-2], docs[-1]
-    text_a = a.get("text") or ""
-    text_b = b.get("text") or ""
-    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
-    path = _save_docx_compare_tables(filename, a['name'], b['name'], text_a, text_b)
-    with open(path, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename=filename))
+
+    pdf_rec = _get_last_pdf_doc(context)
+    if not pdf_rec:
+        await update.message.reply_text("Не найден PDF для сравнения. Сначала загрузите PDF и выполните распознавание.")
+        return
+    rec_text = (pdf_rec.get("text") or "").strip()
+    if not rec_text:
+        await update.message.reply_text("У PDF нет сохранённого текста. Сначала выполните распознавание (OCR).")
+        return
+
+    docx_rec = _get_last_docx_doc(context)
+    if not docx_rec:
+        await update.message.reply_text("Не найден DOCX. Загрузите оригинальный DOCX и повторите.")
+        return
+    orig_path = docx_rec.get("path") or ""
+    if not orig_path:
+        await update.message.reply_text("Не удалось получить путь к DOCX. Пришлите файл ещё раз.")
+        return
+
+    try:
+        original_text = extract_text_from_docx(orig_path) or ""
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка чтения DOCX: {e!r}")
+        return
+    if not original_text.strip():
+        await update.message.reply_text("В DOCX не удалось прочитать текст (пустой).")
+        return
+
+    # Разбиваем на предложения
+    orig_sents = _sentences(original_text)
+    rec_sents  = _sentences(rec_text)
+
+    # Выравнивание и первичная фильтрация (игнор пунктуации/пробелов/регистра)
+    candidate_pairs = _align_sentence_pairs(orig_sents, rec_sents)
+    candidate_pairs = [(o, r) for (o, r) in candidate_pairs if _normalize_meaning(o) != _normalize_meaning(r)]
+
+    # Числовая эвристика: если числа полностью совпадают и нормализация совпадает — пропускаем
+    filtered_pairs = []
+    for o, r in candidate_pairs:
+        onums = _numbers_from_text(o)
+        rnums = _numbers_from_text(r)
+        if onums and rnums and onums == rnums and _normalize_meaning(o) == _normalize_meaning(r):
+            continue
+        filtered_pairs.append((o, r))
+
+    if not filtered_pairs:
+        await update.message.reply_text("Смысловых различий не найдено.")
+        return
+
+    # Финальная фильтрация через Gemini
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    final_pairs = await _gemini_semantic_filter_sentence_pairs(filtered_pairs, api_key)
+
+    if not final_pairs:
+        await update.message.reply_text("Смысловых различий не найдено.")
+        return
+
+    # Формируем DOCX с таблицей 2xN
+    import tempfile
+    tmp_path = None
+    try:
+        doc = DocxDocument()
+        doc.add_heading("Сравнение (только смысловые отличия, по предложениям)", level=1)
+        table = doc.add_table(rows=1, cols=2)
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = "Оригинал (DOCX)"
+        hdr_cells[1].text = "Изменения (PDF OCR)"
+        LIMIT = 500
+        for (o, r) in final_pairs[:LIMIT]:
+            row = table.add_row().cells
+            row[0].text = o
+            row[1].text = r
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+            tmp_path = tmp.name
+        doc.save(tmp_path)
+
+        safe_base = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", (docx_rec.get("name") or "original"))[:40]
+        filename = f"compare_sentences_{safe_base}.docx"
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename=filename), caption="Готово: только смысловые отличия (по предложениям)")
+    finally:
+        if tmp_path:
+            try: os.remove(tmp_path)
+            except Exception: pass
 
 async def doc_clear(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
