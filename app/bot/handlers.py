@@ -1,6 +1,6 @@
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
-import os, re, time, asyncio, logging, difflib
+import os, re, time, asyncio, logging, difflib, json
 from pathlib import Path
 from typing import Any, Optional
 
