@@ -3,6 +3,21 @@ import time
 import asyncio
 import logging
 import json
+
+# ===== Sentence split regex ===========================================
+# Делим по пробелам после . ? ! , избегая случаев "И. О." или "X.X."
+import re
+
+_SENT_SPLIT_RE = re.compile(
+    r'''(?x)                                   # verbose mode
+        (?<!\w\.\w\.)                          # не после X.X.
+        (?<![A-Za-zА-Яа-я]\.)                  # не после одиночной буквы с точкой
+        (?<=\.|\?|!)                           # сразу после . ? !
+        \s+                                    # один или больше пробелов/переводов строки
+    '''
+)
+# =====================================================================
+
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
 import os, re, time, asyncio, logging, difflib, json
