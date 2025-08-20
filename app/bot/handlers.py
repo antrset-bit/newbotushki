@@ -561,6 +561,21 @@ def _get_last_pdf_doc(context) -> dict | None:
 
 
 
+def _get_last_docx_doc(context) -> dict | None:
+    """
+    Возвращает последний загруженный документ с расширением .docx
+    из контекста (work_docs + docs).
+    """
+    docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
+    for rec in reversed(docs):
+        name = (rec.get("name") or "").lower()
+        if name.endswith(".docx"):
+            return rec
+    return None
+
+
+
+
 async def pdf_to_txt(update: Update, context: Any):
     """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
     rec = _get_last_pdf_doc(context)
@@ -775,6 +790,7 @@ def build_application():
     app.add_error_handler(error_handler)
     return app
 \n\n
+
 async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
     """
     Финальная фильтрация различий через Gemini.
@@ -785,31 +801,39 @@ async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
     """
     if not pairs:
         return []
-    # 0) Ключ
     key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
         logging.getLogger("semantic-bot").info("[Gemini] API key missing — skip filtering")
         return pairs
     try:
         logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
-        # 1) Конфиг клиента
         genai.configure(api_key=key)
         model = genai.GenerativeModel("gemini-1.5-flash")
-        # 2) Формируем промпт
         items = [{"original": o, "recognized": r} for (o, r) in pairs]
         prompt = (
-            "Ты — юридический редактор. Даны пары предложений из договора:\n"
-            "- ORIGINAL — из исходного DOCX\n"
-            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)\n\n"
-            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).\n"
-            "Игнорируй различия в пробелах, регистре и пунктуации.\n"
-            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.\n\n"
-            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:\n"
-            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.\n\n"
-            "PAIRS:\n"
+            "Ты — юридический редактор. Даны пары предложений из договора.
+"
+            "- ORIGINAL — из исходного DOCX
+"
+            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
+
+"
+            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
+"
+            "Игнорируй различия в пробелах, регистре и пунктуации.
+"
+            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
+
+"
+            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
+"
+            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.
+
+"
+            "PAIRS:
+"
             + json.dumps(items, ensure_ascii=False)
         )
-        # 3) Вызов модели
         resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
         raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
         data = json.loads(raw) if raw else []
@@ -828,4 +852,3 @@ async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
     except Exception as e:
         logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
         return pairs
-\n
