@@ -55,7 +55,19 @@ INDEX_DEDUP_TTL = 600
 
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
     parts, buf, cur = [], [], 0
-    for p in text.replace("\r\n", "\n").split("\n\n"):
+    for p in text.replace("\r\n", "\n").split("
+
+# --- Gemini API key presence check (one-time) ---
+GEMINI_KEY_CHECK_DONE = False
+def _log_gemini_key_presence():
+    global GEMINI_KEY_CHECK_DONE
+    if GEMINI_KEY_CHECK_DONE:
+        return
+    _key_present = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+    logging.getLogger("semantic-bot").info("[Gemini] API key present: %s", _key_present)
+    GEMINI_KEY_CHECK_DONE = True
+_log_gemini_key_presence()
+\n\n"):
         p = p.strip()
         if not p:
             chunk = "\n\n".join(buf).strip()
@@ -762,3 +774,58 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     return app
+\n\n
+async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
+    """
+    Финальная фильтрация различий через Gemini.
+    ЛОГИ:
+      - [Gemini] filtering enabled, pairs: N
+      - [Gemini] filtered pairs: M
+      - [Gemini] filter failed: <error>
+    """
+    if not pairs:
+        return []
+    # 0) Ключ
+    key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not key:
+        logging.getLogger("semantic-bot").info("[Gemini] API key missing — skip filtering")
+        return pairs
+    try:
+        logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
+        # 1) Конфиг клиента
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        # 2) Формируем промпт
+        items = [{"original": o, "recognized": r} for (o, r) in pairs]
+        prompt = (
+            "Ты — юридический редактор. Даны пары предложений из договора:\n"
+            "- ORIGINAL — из исходного DOCX\n"
+            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)\n\n"
+            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).\n"
+            "Игнорируй различия в пробелах, регистре и пунктуации.\n"
+            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.\n\n"
+            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:\n"
+            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.\n\n"
+            "PAIRS:\n"
+            + json.dumps(items, ensure_ascii=False)
+        )
+        # 3) Вызов модели
+        resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
+        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
+        data = json.loads(raw) if raw else []
+        out = []
+        if isinstance(data, list):
+            for item in data:
+                try:
+                    o = (item.get("original") or "").strip()
+                    r = (item.get("recognized") or "").strip()
+                    if o and r:
+                        out.append((o, r))
+                except Exception:
+                    continue
+        logging.getLogger("semantic-bot").info("[Gemini] filtered pairs: %s", len(out) if out else 0)
+        return out or pairs
+    except Exception as e:
+        logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
+        return pairs
+\n
