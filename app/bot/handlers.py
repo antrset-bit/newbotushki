@@ -1,3 +1,4 @@
+import inspect
 import time
 import asyncio
 import logging
@@ -876,19 +877,14 @@ PAIRS:
         + json.dumps([{"original": o, "recognized": r} for (o, r) in items], ensure_ascii=False)
     )
 
-async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], api_key: str | None):
+
+async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
     log = logging.getLogger("semantic-bot")
     log.info("[Gemini] entry: pairs=%s", len(pairs) if pairs else 0)
 
     if not pairs:
         log.info("[Gemini] no pairs — nothing to filter")
         return []
-
-    try:
-        key_present = bool(api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
-    except Exception:
-        key_present = False
-    log.info("[Gemini] key_present=%s", key_present)
 
     key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
@@ -903,15 +899,33 @@ async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], a
         log.exception("[Gemini] init failed: %r — using heuristic", e)
         return [(o, r) for (o, r) in pairs if _heuristic_semantic_diff(o, r)]
 
+    # smaller batches
+    def _batch_pairs_by_limits(items, max_pairs: int = 40, max_chars: int = 12000):
+        batch, cur_chars = [], 0
+        for (o, r) in items:
+            o_t, r_t = (o or "").strip(), (r or "").strip()
+            payload = json.dumps({"original": o_t, "recognized": r_t}, ensure_ascii=False)
+            if (len(batch) >= max_pairs) or (cur_chars + len(payload) > max_chars):
+                if batch:
+                    yield batch
+                batch, cur_chars = [], 0
+            batch.append((o_t, r_t))
+            cur_chars += len(payload)
+        if batch:
+            yield batch
+
     batches = list(_batch_pairs_by_limits(pairs, max_pairs=40, max_chars=12000))
     log.info("[Gemini] filtering enabled, total pairs: %s, batches: %s", len(pairs), len(batches))
 
-    filtered_total: List[Tuple[str, str]] = []
-    i = 0
-    while i < len(batches):
-        batch = batches[i]
-        prompt = _build_prompt(batch)
+    filtered_total = []
+    disable_gemini_for_run = False
 
+    for i, batch in enumerate(batches):
+        if disable_gemini_for_run:
+            filtered_total.extend([(o, r) for (o, r) in batch if _heuristic_semantic_diff(o, r)])
+            continue
+
+        prompt = _build_prompt(batch)
         try:
             tok = await _count_tokens_safe(model, prompt)
             if tok > 30000 and len(batch) > 1:
@@ -923,51 +937,49 @@ async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], a
             pass
 
         attempt, last_err = 0, None
-        while attempt < 2:
+        while attempt < 2 and not disable_gemini_for_run:
             attempt += 1
             try:
                 log.info("[Gemini] batch %s/%s, size: %s (attempt %s)", i+1, len(batches), len(batch), attempt)
                 resp = await asyncio.to_thread(
                     lambda: model.generate_content(
                         contents=[{"role": "user", "parts": [{"text": prompt}]}],
-                        generation_config={"response_mime_type": "application/json"},
+                        generation_config={
+                            "response_mime_type": "application/json",
+                            "temperature": 0.0,
+                            "candidate_count": 1,
+                        },
                     )
                 )
                 raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
-                data = _extract_json_array(raw) if raw_clean else []
+                data = _extract_json_array(raw)
                 if not isinstance(data, list):
-                    raise ValueError("Non-list JSON from Gemini")
+                    raise ValueError("Gemini did not return a JSON array")
 
                 kept = 0
                 for item in data:
-                    o = (item.get("original") or "").strip()
-                    r = (item.get("recognized") or "").strip()
+                    o = (item.get("original") or "").strip() if isinstance(item, dict) else ""
+                    r = (item.get("recognized") or "").strip() if isinstance(item, dict) else ""
                     if o and r and _heuristic_semantic_diff(o, r):
-                        filtered_total.append((o, r))
-                        kept += 1
-
+                        filtered_total.append((o, r)); kept += 1
                 log.info("[Gemini] batch %s kept: %s/%s", i+1, kept, len(batch))
                 break
             except Exception as e:
                 last_err = e
-                log.warning("[Gemini] batch %s failed: %r", i+1, e)
+                msg = f"{e.__class__.__name__}: {e}"
+                log.warning("[Gemini] batch %s failed: %s", i+1, msg)
+                if ("ResourceExhausted" in e.__class__.__name__) or ("quota" in str(e).lower()):
+                    log.error("[Gemini] quota hit — disabling Gemini for this run, using heuristic for remaining batches")
+                    disable_gemini_for_run = True
+                    break
                 await asyncio.sleep(0.6 * attempt)
 
-        if last_err and attempt >= 2:
+        if last_err and (attempt >= 2 or disable_gemini_for_run):
             log.error("[Gemini] batch %s fallback to heuristic due to persistent error: %r", i+1, last_err)
             filtered_total.extend([(o, r) for (o, r) in batch if _heuristic_semantic_diff(o, r)])
 
-        i += 1
-
     log.info("[Gemini] filtered pairs total: %s (from %s)", len(filtered_total), len(pairs))
     return filtered_total
-
-gemini_semantic_filter_sentence_pairs = _gemini_semantic_filter_sentence_pairs
-gemini_filter_pairs = _gemini_semantic_filter_sentence_pairs
-
-
-# ---------- Semantic sentence pairing & report ----------
-_SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|\n+')
 
 def _split_sentences(text: str):
     text = (text or "").strip()
@@ -1061,24 +1073,54 @@ def _extract_json_array(raw: str):
 
 
 
+
 def _save_compare_report_with_adapter(filtered_pairs, filename, a_name, b_name, text_a, text_b):
     """
-    Try to call project _save_docx_compare_tables if it exists and expects extended args.
-    Fallback to our own DOCX/TSV writer.
+    Universal caller for project _save_docx_compare_tables with signature detection.
+    Tries keyword invocation via inspect.signature; then tries several positional orders.
+    Fallbacks to DOCX/TSV writer.
     """
     if "_save_docx_compare_tables" in globals():
+        fn = _save_docx_compare_tables
+        # Keyword attempt
         try:
-            # common: (pairs, filename, doc_name_b, text_a, text_b)
-            return _save_docx_compare_tables(filtered_pairs, filename, b_name, text_a, text_b)
-        except TypeError:
-            try:
-                # alternative: (pairs, filename, doc_name_a, doc_name_b, text_a, text_b)
-                return _save_docx_compare_tables(filtered_pairs, filename, a_name, b_name, text_a, text_b)
-            except Exception:
-                logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables signature mismatch")
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.keys())
+            kwargs = {}
+            mapping = {
+                "pairs": filtered_pairs,
+                "filtered_pairs": filtered_pairs,
+                "filename": filename,
+                "doc_name_a": a_name,
+                "doc_name_b": b_name,
+                "text_a": text_a,
+                "text_b": text_b,
+            }
+            for p in params:
+                if p in mapping:
+                    kwargs[p] = mapping[p]
+            if kwargs and ("filename" in kwargs and ("pairs" in kwargs or "filtered_pairs" in kwargs)):
+                return fn(**kwargs)
         except Exception:
-            logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables failed")
-    # fallback
+            logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables kwargs call failed; try positional")
+
+        # Positional attempts
+        orders = [
+            (filename, filtered_pairs, b_name, text_a, text_b),
+            (filename, filtered_pairs, a_name, b_name, text_a, text_b),
+            (filtered_pairs, filename, b_name, text_a, text_b),
+            (filtered_pairs, filename, a_name, b_name, text_a, text_b),
+        ]
+        for args in orders:
+            try:
+                return fn(*args)
+            except TypeError:
+                continue
+            except Exception:
+                logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables positional attempt failed; trying next")
+        logging.getLogger("semantic-bot").error("Project _save_docx_compare_tables signature mismatch — using fallback writer")
+
+    # Fallback writer
     try:
         from docx import Document as DocxDocument
         os.makedirs("generated_reports", exist_ok=True)
@@ -1103,8 +1145,7 @@ def _save_compare_report_with_adapter(filtered_pairs, filename, a_name, b_name, 
         with open(path, "w", encoding="utf-8") as f:
             f.write("Оригинал\tРаспознанный\n")
             for o, r in filtered_pairs:
-                line_o = (o or '').replace('\t',' ')
-            line_r = (r or '').replace('\t',' ')
-            f.write(line_o + '\t' + line_r + '\n')
+                line_o = (o or "").replace("\t", " ")
+                line_r = (r or "").replace("\t", " ")
+                f.write(line_o + "\t" + line_r + "\n")
         return path
-
