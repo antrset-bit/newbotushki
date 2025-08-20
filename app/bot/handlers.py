@@ -3,31 +3,6 @@
 import os, re, time, asyncio, logging, difflib
 from pathlib import Path
 from typing import Any, Optional
-import asyncio
-import json
-import logging
-import math
-import time
-from typing import List, Tuple
-
-# --- ensure logging shows our INFO messages ---
-_semantic_logger = logging.getLogger("semantic-bot")
-if not _semantic_logger.handlers:
-    _handler = logging.StreamHandler()
-    _formatter = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
-    _handler.setFormatter(_formatter)
-    _semantic_logger.addHandler(_handler)
-# If uvicorn set root level to WARNING, bump our logger level to INFO explicitly
-_semantic_logger.setLevel(logging.INFO)
-del _handler, _formatter
-
-
-
-
-
-
-
-
 
 from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
 from telegram.ext import MessageHandler, CommandHandler, filters, ApplicationBuilder
@@ -80,16 +55,7 @@ INDEX_DEDUP_TTL = 600
 
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
     parts, buf, cur = [], [], 0
-    for p in text.replace("\r\n", "\n").split("\n"):
-        if len(p) + cur > max_len:
-            parts.append("\n".join(buf))
-            buf, cur = [p], len(p)
-        else:
-            buf.append(p)
-            cur += len(p)
-    if buf:
-        parts.append("\n".join(buf))
-    return parts
+    for p in text.replace("\r\n", "\n").split("
 
 # --- Gemini API key presence check (one-time) ---
 GEMINI_KEY_CHECK_DONE = False
@@ -101,6 +67,27 @@ def _log_gemini_key_presence():
     logging.getLogger("semantic-bot").info("[Gemini] API key present: %s", _key_present)
     GEMINI_KEY_CHECK_DONE = True
 _log_gemini_key_presence()
+\n\n"):
+        p = p.strip()
+        if not p:
+            chunk = "\n\n".join(buf).strip()
+            if chunk: parts.append(chunk)
+            buf, cur = [], 0
+            continue
+        need = len(p) + (2 if cur > 0 else 0)
+        if cur + need <= max_len:
+            buf.append(p); cur += need
+        else:
+            chunk = "\n\n".join(buf).strip()
+            if chunk: parts.append(chunk)
+            buf, cur = [], 0
+            while len(p) > max_len:
+                parts.append(p[:max_len]); p = p[max_len:]
+            if p:
+                buf, cur = [p], len(p)
+    chunk = "\n\n".join(buf).strip()
+    if chunk: parts.append(chunk)
+    return parts
 
 async def send_long(update: Update, text: str):
     text = (text or "").strip() or "⚠️ Пустой ответ. Попробуйте переформулировать запрос или загрузить документ заново."
@@ -574,21 +561,6 @@ def _get_last_pdf_doc(context) -> dict | None:
 
 
 
-def _get_last_docx_doc(context) -> dict | None:
-    """
-    Возвращает последний загруженный документ с расширением .docx
-    из контекста (work_docs + docs).
-    """
-    docs = (context.user_data.get("work_docs") or []) + (context.user_data.get("docs") or [])
-    for rec in reversed(docs):
-        name = (rec.get("name") or "").lower()
-        if name.endswith(".docx"):
-            return rec
-    return None
-
-
-
-
 async def pdf_to_txt(update: Update, context: Any):
     """Конвертирует последний загруженный PDF в TXT и отправляет файл пользователю."""
     rec = _get_last_pdf_doc(context)
@@ -638,29 +610,16 @@ async def doc_summary(update: Update, context: Any):
         return
     last = docs[-1]
     retrieved = await _work_retrieve([last], "краткое резюме документа с фокусом на тип работ/услуг/поставки/агентских/аренды", k=12)
-
-
-
     prompt = (
-        """Ты — юридический редактор. Даны пары предложений из договора.
-- ORIGINAL — из исходного DOCX
-- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
-
-Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
-Игнорируй различия в пробелах, регистре и пунктуации.
-Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
-
-Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
-{"original": "...", "recognized": "..."} — только для пар с СМЫСЛОВЫМ отличием.
-
-PAIRS:
-"""
-        + json.dumps(items, ensure_ascii=False)
+        "Ты — юридический ассистент. На основе КОНТЕКСТА составь краткое, но точное резюме договора.\n"
+        "Обязательно:\n"
+        "• Определи ТИП правоотношения и предмет: что именно делает исполнитель для заказчика (выбери из: выполнение работ, оказание услуг, поставка, агентские услуги, аренда), укажи формулировку из документа.\n"
+        "• Стороны (наименования), срок, цена/порядок оплаты, ответственность/неустойки, расторжение, конфиденциальность/ПДн, права на результаты (если есть).\n"
+        "• Избегай общих фраз «предмет договора» — пиши конкретное действие.\n"
+        "Формат:\n"
+        "— Тип/Предмет: …\n— Стороны: …\n— Срок: …\n— Цена/оплата: …\n— Ответственность: …\n— Расторжение: …\n— Конфиденциальность/ПДн: …\n— Права на РИД: …\n"
+        "Используй только факты из контекста, без выдумок."
     )
-
-
-
-
     answer = generate_answer_with_gemini(prompt, retrieved) or ""
     if not answer.strip() or answer.strip().startswith("⚠️"):
         answer = _fallback_summary(last["text"])
@@ -815,199 +774,58 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     return app
-
-
-
-
-
-
-# ===== Gemini batched semantic filter (robust) =====
-
-def _truncate(s: str, max_chars: int = 2000) -> str:
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[: max_chars - 10] + " [TRUNC]"
-
-def _normalize_for_semantic(s: str) -> str:
-    import re as _re
-    s = (s or "").lower()
-    s = _re.sub(r"[\s]+", " ", s)
-    s = _re.sub(r"[.,;:!?\"'«»()\[\]{}–—-]", "", s)
-    return s.strip()
-
-def _numbers_in(s: str):
-    import re as _re
-    return _re.findall(r"\d+[\d\s.,/-]*\d|\d+", s)
-
-def _heuristic_semantic_diff(o: str, r: str) -> bool:
-    o_norm, r_norm = _normalize_for_semantic(o), _normalize_for_semantic(r)
-    if o_norm == r_norm:
-        return False
-    o_nums, r_nums = _numbers_in(o_norm), _numbers_in(r_norm)
-    if o_nums != r_nums:
-        return True
-    try:
-        import difflib
-        ratio = difflib.SequenceMatcher(a=o_norm, b=r_norm).ratio()
-        return ratio < 0.9
-    except Exception:
-        return True
-
-async def _count_tokens_safe(model, text: str) -> int:
-    try:
-        ct = await asyncio.to_thread(model.count_tokens, text)
-        # Different versions expose different attributes
-        for attr in ("total_tokens", "total_token_count", "token_count"):
-            if hasattr(ct, attr):
-                val = getattr(ct, attr)
-                try:
-                    return int(getattr(val, "value", val))
-                except Exception:
-                    try:
-                        return int(val)
-                    except Exception:
-                        pass
-        return 0
-    except Exception:
-        return math.ceil(len(text) / 4)
-
-def _batch_pairs_by_limits(items: List[Tuple[str, str]], max_pairs: int = 60, max_chars: int = 18000):
-    batch, cur_chars = [], 0
-    for (o, r) in items:
-        o_t, r_t = _truncate(o), _truncate(r)
-        payload = json.dumps({"original": o_t, "recognized": r_t}, ensure_ascii=False)
-        if (len(batch) >= max_pairs) or (cur_chars + len(payload) > max_chars):
-            if batch:
-                yield batch
-            batch, cur_chars = [], 0
-        batch.append((o_t, r_t))
-        cur_chars += len(payload)
-    if batch:
-        yield batch
-
-def _build_prompt(items: List[Tuple[str, str]]) -> str:
-    return (
-        """Ты — юридический редактор. Даны пары предложений из договора.
-- ORIGINAL — из исходного DOCX
-- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
-
-Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
-Игнорируй различия в пробелах, регистре и пунктуации.
-Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
-
-Верни ЧИСТЫЙ JSON-массив объектов (без подсказок/комментариев, БЕЗ Markdown-кода):
-[
-  {"original": "...", "recognized": "..."},
-  ...
-]
-
-PAIRS:
-"""
-        + json.dumps([{"original": o, "recognized": r} for (o, r) in items], ensure_ascii=False)
-    )
-
-async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], api_key: str | None):
-    log = logging.getLogger("semantic-bot")
-    try:
-    key_present = bool(api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
-    except Exception:
-    key_present = False
-    log.info("[Gemini] entry: pairs=%s, key_present=%s", len(pairs) if pairs else 0, key_present)
-    log = logging.getLogger("semantic-bot")
+\n\n
+async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
+    """
+    Финальная фильтрация различий через Gemini.
+    ЛОГИ:
+      - [Gemini] filtering enabled, pairs: N
+      - [Gemini] filtered pairs: M
+      - [Gemini] filter failed: <error>
+    """
     if not pairs:
         return []
-
+    # 0) Ключ
     key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
-        log.info("[Gemini] API key missing — skip filtering; using heuristic")
-        return [(o, r) for (o, r) in pairs if _heuristic_semantic_diff(o, r)]
-
+        logging.getLogger("semantic-bot").info("[Gemini] API key missing — skip filtering")
+        return pairs
     try:
-        import google.generativeai as genai
+        logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
+        # 1) Конфиг клиента
         genai.configure(api_key=key)
         model = genai.GenerativeModel("gemini-1.5-flash")
-    except Exception as e:
-        log.exception("[Gemini] init failed: %r — using heuristic", e)
-        return [(o, r) for (o, r) in pairs if _heuristic_semantic_diff(o, r)]
-
-    batches = list(_batch_pairs_by_limits(pairs, max_pairs=60, max_chars=18000))
-    log.info("[Gemini] filtering enabled, total pairs: %s, batches: %s", len(pairs), len(batches))
-
-    filtered_total: List[Tuple[str, str]] = []
-    i = 0
-    while i < len(batches):
-        batch = batches[i]
-        prompt = _build_prompt(batch)
-
-        # Token safety: optional split if too big
-        try:
-            tok = await _count_tokens_safe(model, prompt)
-            if tok > 30000 and len(batch) > 1:
-                mid = len(batch) // 2
-                batches[i:i+1] = [batch[:mid], batch[mid:]]
-                log.info("[Gemini] split batch %s due to token estimate %s", i+1, tok)
-                continue
-        except Exception:
-            pass
-
-        attempt, last_err = 0, None
-        while attempt < 2:
-            attempt += 1
-            try:
-                log.info("[Gemini] batch %s/%s, size: %s (attempt %s)", i+1, len(batches), len(batch), attempt)
-                resp = await asyncio.to_thread(
-                    lambda: model.generate_content(
-                        contents=[{"role": "user", "parts": [{"text": prompt}]}],
-                        generation_config={"response_mime_type": "application/json"},
-                    )
-                )
-                raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
-                raw_clean = raw.strip()
-                if raw_clean.startswith("```"):
-                    raw_clean = raw_clean.strip("`")
-                    if raw_clean.lower().startswith("json"):
-                        raw_clean = raw_clean[4:].strip()
-                data = json.loads(raw_clean) if raw_clean else []
-                if not isinstance(data, list):
-                    raise ValueError("Non-list JSON from Gemini")
-
-                kept = 0
-                for item in data:
+        # 2) Формируем промпт
+        items = [{"original": o, "recognized": r} for (o, r) in pairs]
+        prompt = (
+            "Ты — юридический редактор. Даны пары предложений из договора:\n"
+            "- ORIGINAL — из исходного DOCX\n"
+            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)\n\n"
+            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).\n"
+            "Игнорируй различия в пробелах, регистре и пунктуации.\n"
+            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.\n\n"
+            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:\n"
+            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.\n\n"
+            "PAIRS:\n"
+            + json.dumps(items, ensure_ascii=False)
+        )
+        # 3) Вызов модели
+        resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
+        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
+        data = json.loads(raw) if raw else []
+        out = []
+        if isinstance(data, list):
+            for item in data:
+                try:
                     o = (item.get("original") or "").strip()
                     r = (item.get("recognized") or "").strip()
-                    if o and r and _heuristic_semantic_diff(o, r):
-                        filtered_total.append((o, r))
-                        kept += 1
-
-                log.info("[Gemini] batch %s kept: %s/%s", i+1, kept, len(batch))
-                break
-            except Exception as e:
-                last_err = e
-                log.warning("[Gemini] batch %s failed: %r", i+1, e)
-                await asyncio.sleep(0.6 * attempt)
-
-        if last_err and attempt >= 2:
-            log.error("[Gemini] batch %s fallback to heuristic due to persistent error: %r", i+1, last_err)
-            filtered_total.extend([(o, r) for (o, r) in batch if _heuristic_semantic_diff(o, r)])
-
-        i += 1
-
-    log.info("[Gemini] filtered pairs total: %s (from %s)", len(filtered_total), len(pairs))
-    return filtered_total
-
-
-
-# Shims: if the rest of the code calls other names, route them here
-gemini_semantic_filter_sentence_pairs = _gemini_semantic_filter_sentence_pairs
-gemini_filter_pairs = _gemini_semantic_filter_sentence_pairs
-
-
-async def _gemini_probe_log():
-    try:
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        key_present = bool(api_key)
-        log = logging.getLogger("semantic-bot")
-        log.info("[Gemini] API key present (probe): %s", key_present)
+                    if o and r:
+                        out.append((o, r))
+                except Exception:
+                    continue
+        logging.getLogger("semantic-bot").info("[Gemini] filtered pairs: %s", len(out) if out else 0)
+        return out or pairs
     except Exception as e:
-        logging.getLogger("semantic-bot").error("[Gemini] probe log failed: %s", e)
+        logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
+        return pairs
+\n
