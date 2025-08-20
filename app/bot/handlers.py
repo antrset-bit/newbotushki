@@ -442,7 +442,6 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
         finally:
             _pdf_job_finish(context, key)
         return
-
     # DOC / DOCX
     if ext == "docx":
         text = extract_text_from_docx(file_path)
@@ -452,7 +451,6 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
     if not (text or "").strip():
         await update.message.reply_text("Не удалось извлечь текст из документа. Убедитесь, что это не пустой/защищённый файл.")
         return
-
     chunks = smart_split_text(text)
     context.user_data.setdefault("work_docs", []).append({"name": fname, "path": file_path, "text": text, "chunks": chunks})
     await update.message.reply_text(f"Файл добавлен в контекст: {fname}. Документов в сессии: {len(context.user_data['work_docs'])}.")
@@ -467,11 +465,9 @@ async def handle_file(update: Update, context: Any):
     if ext not in ("pdf", "docx", "txt", "doc"):
         await update.message.reply_text("Поддерживаются только PDF, DOCX, DOC (и TXT для глобальной индексации).")
         return
-
     if context.user_data.get("mode") == "work":
         await _work_handle_file(update, context, document)
         return
-
     os.makedirs(DOC_FOLDER, exist_ok=True)
     ts = int(time.time())
     file_path = os.path.join(DOC_FOLDER, f"{base}_{ts}.{ext}")
@@ -488,12 +484,10 @@ async def handle_file(update: Update, context: Any):
     if file_hash and file_hash in manifest.get("hashes", {}):
         await update.message.reply_text("Этот файл уже проиндексирован ранее. Можете задавать вопросы.")
         return
-
     # start indexing once; dedup by file_unique_id + hash
     key = _index_job_key(document.file_unique_id, file_hash)
     if _idx_is_running(context, key):
         return
-
     progress = await update.message.reply_text("Файл загружен. Индексация началась…")
     _idx_start(context, key, progress.message_id)
 
@@ -651,6 +645,7 @@ async def doc_check(update: Update, context: Any):
 
 
 
+
 async def doc_compare(update, context):
     docs = context.user_data.get("work_docs") or []
     if len(docs) < 2:
@@ -668,52 +663,21 @@ async def doc_compare(update, context):
         logging.getLogger("semantic-bot").exception("[Gemini] filtering call failed — using heuristic: %r", e)
         filtered = [(o, r) for (o, r) in raw_pairs if _heuristic_semantic_diff(o, r)]
 
-    # prefer user's existing writer if present
-    if "_save_docx_compare_tables" in globals():
-        filename = f"{int(time.time())}_changes_{Path(a.get('name','orig')).stem}_to_{Path(b.get('name','rec')).stem}.docx"
-        path = _save_docx_compare_tables(filtered, filename)
-    else:
-        # fallback minimal writer
-        filename = f"{int(time.time())}_changes_{Path(a.get('name','orig')).stem}_to_{Path(b.get('name','rec')).stem}.docx"
-        path = os.path.join(os.getcwd(), filename)
-        try:
-            from docx import Document as DocxDocument
-            doc = DocxDocument()
-            table = doc.add_table(rows=1, cols=2)
-            table.rows[0].cells[0].text = "Оригинал (DOCX)"
-            table.rows[0].cells[1].text = "Распознанный (OCR)"
-            for o, r in filtered:
-                row = table.add_row().cells
-                row[0].text = o or "—"
-                row[1].text = r or "—"
-            doc.save(path)
-        except Exception as e:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("Оригинал\tРаспознанный\n")
-                for o, r in filtered:
-                    f.write(f"{o}\t{r}\n")
+    filename = f"{int(time.time())}_changes_{Path(a.get('name','original')).stem}_to_{Path(b.get('name','recognized')).stem}.docx"
+    path = _save_compare_report_with_adapter(
+        filtered_pairs=filtered,
+        filename=filename,
+        a_name=a.get('name','original.docx'),
+        b_name=b.get('name','recognized.docx'),
+        text_a=text_a,
+        text_b=text_b,
+    )
 
-    with open(path, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename=os.path.basename(path)))
-    return
-
-    a, b = docs[-2], docs[-1]
-    text_a = a.get("text") or ""
-    text_b = b.get("text") or ""
-
-    raw_pairs = _pair_sentences(text_a, text_b)
-    logging.getLogger("semantic-bot").info("[Gemini] call site: got %s raw pairs before filtering", len(raw_pairs))
     try:
-        filtered = await _gemini_semantic_filter_sentence_pairs(raw_pairs, api_key=None)
-    except Exception as e:
-        logging.getLogger("semantic-bot").exception("[Gemini] filtering call failed — using heuristic: %r", e)
-        filtered = [(o, r) for (o, r) in raw_pairs if _heuristic_semantic_diff(o, r)]
-
-    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
-    path = _save_docx_semantic_pairs(filename, a['name'], b['name'], filtered)
-    with open(path, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename=filename))
-    return
+        with open(path, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename=os.path.basename(path)))
+    except Exception:
+        await update.message.reply_text(f"Файл подготовлен: {path}")
 
 
 async def doc_clear(update: Update, context: Any):
@@ -766,7 +730,6 @@ async def handle_text(update: Update, context: Any):
             left = max(0, DAILY_FREE_LIMIT - get_usage(uid))
             await update.message.reply_text(f"Остаток на сегодня: {left}.")
         return
-
     if mode == "work":
         docs = context.user_data.get("work_docs") or []
         if not docs:
@@ -778,7 +741,6 @@ async def handle_text(update: Update, context: Any):
             answer = "Краткая справка по загруженным документам:\n" + _fallback_summary("\n\n".join(retrieved) if retrieved else docs[-1]["text"])
         await send_long(update, answer)
         return
-
     if mode == "tm":
         low = user_query.lower()
         if low.startswith("/tm_reg"):
@@ -787,11 +749,9 @@ async def handle_text(update: Update, context: Any):
             await tm_cmd_exp(update, context); return
         await tm_handle_text(update, context)
         return
-
     if not (os.path.exists(INDEX_FILE) and os.path.exists(TEXTS_FILE)):
         await update.message.reply_text("Нет проиндексированных документов. Сначала загрузите файл.")
         return
-
     def _answer_job():
         try:
             chunks = retrieve_chunks(user_query, k=RETRIEVAL_K)
@@ -943,7 +903,7 @@ async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], a
         log.exception("[Gemini] init failed: %r — using heuristic", e)
         return [(o, r) for (o, r) in pairs if _heuristic_semantic_diff(o, r)]
 
-    batches = list(_batch_pairs_by_limits(pairs, max_pairs=60, max_chars=18000))
+    batches = list(_batch_pairs_by_limits(pairs, max_pairs=40, max_chars=12000))
     log.info("[Gemini] filtering enabled, total pairs: %s, batches: %s", len(pairs), len(batches))
 
     filtered_total: List[Tuple[str, str]] = []
@@ -974,12 +934,7 @@ async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], a
                     )
                 )
                 raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
-                raw_clean = raw.strip()
-                if raw_clean.startswith("```"):
-                    raw_clean = raw_clean.strip("`")
-                    if raw_clean.lower().startswith("json"):
-                        raw_clean = raw_clean[4:].strip()
-                data = json.loads(raw_clean) if raw_clean else []
+                data = _extract_json_array(raw) if raw_clean else []
                 if not isinstance(data, list):
                     raise ValueError("Non-list JSON from Gemini")
 
@@ -1102,4 +1057,54 @@ def _extract_json_array(raw: str):
         except Exception:
             pass
     return []
+
+
+
+
+def _save_compare_report_with_adapter(filtered_pairs, filename, a_name, b_name, text_a, text_b):
+    """
+    Try to call project _save_docx_compare_tables if it exists and expects extended args.
+    Fallback to our own DOCX/TSV writer.
+    """
+    if "_save_docx_compare_tables" in globals():
+        try:
+            # common: (pairs, filename, doc_name_b, text_a, text_b)
+            return _save_docx_compare_tables(filtered_pairs, filename, b_name, text_a, text_b)
+        except TypeError:
+            try:
+                # alternative: (pairs, filename, doc_name_a, doc_name_b, text_a, text_b)
+                return _save_docx_compare_tables(filtered_pairs, filename, a_name, b_name, text_a, text_b)
+            except Exception:
+                logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables signature mismatch")
+        except Exception:
+            logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables failed")
+    # fallback
+    try:
+        from docx import Document as DocxDocument
+        os.makedirs("generated_reports", exist_ok=True)
+        path = os.path.join("generated_reports", filename)
+        doc = DocxDocument()
+        doc.add_heading(f"Смысловые отличия: {a_name} → {b_name}", level=1)
+        if not filtered_pairs:
+            doc.add_paragraph("Смысловых отличий не найдено.")
+        else:
+            table = doc.add_table(rows=1, cols=2)
+            table.rows[0].cells[0].text = "Оригинал (DOCX)"
+            table.rows[0].cells[1].text = "Распознанный (OCR)"
+            for o, r in filtered_pairs:
+                row = table.add_row().cells
+                row[0].text = o or "—"
+                row[1].text = r or "—"
+        doc.save(path)
+        return path
+    except Exception:
+        os.makedirs("generated_reports", exist_ok=True)
+        path = os.path.join("generated_reports", filename.replace(".docx", ".tsv"))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("Оригинал\tРаспознанный\n")
+            for o, r in filtered_pairs:
+                line_o = (o or '').replace('\t',' ')
+            line_r = (r or '').replace('\t',' ')
+            f.write(line_o + '\t' + line_r + '\n')
+        return path
 
