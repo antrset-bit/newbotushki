@@ -76,27 +76,6 @@ def _log_gemini_key_presence():
     logging.getLogger("semantic-bot").info("[Gemini] API key present: %s", _key_present)
     GEMINI_KEY_CHECK_DONE = True
 _log_gemini_key_presence()
-\n\n"):
-        p = p.strip()
-        if not p:
-            chunk = "\n\n".join(buf).strip()
-            if chunk: parts.append(chunk)
-            buf, cur = [], 0
-            continue
-        need = len(p) + (2 if cur > 0 else 0)
-        if cur + need <= max_len:
-            buf.append(p); cur += need
-        else:
-            chunk = "\n\n".join(buf).strip()
-            if chunk: parts.append(chunk)
-            buf, cur = [], 0
-            while len(p) > max_len:
-                parts.append(p[:max_len]); p = p[max_len:]
-            if p:
-                buf, cur = [p], len(p)
-    chunk = "\n\n".join(buf).strip()
-    if chunk: parts.append(chunk)
-    return parts
 
 async def send_long(update: Update, text: str):
     text = (text or "").strip() or "⚠️ Пустой ответ. Попробуйте переформулировать запрос или загрузить документ заново."
