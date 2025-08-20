@@ -777,9 +777,64 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     return app
-\n\n
+
+
 
 async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
+    if not pairs:
+        return []
+    key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not key:
+        logging.getLogger("semantic-bot").info("[Gemini] API key missing — skip filtering")
+        return pairs
+    try:
+        logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        items = [{"original": o, "recognized": r} for (o, r) in pairs]
+        prompt = (
+            "Ты — юридический редактор. Даны пары предложений из договора.
+"
+            "- ORIGINAL — из исходного DOCX
+"
+            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
+
+"
+            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
+"
+            "Игнорируй различия в пробелах, регистре и пунктуации.
+"
+            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
+
+"
+            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:
+"
+            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.
+
+"
+            "PAIRS:
+"
+            + json.dumps(items, ensure_ascii=False)
+        )
+        resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
+        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
+        data = json.loads(raw) if raw else []
+        out = []
+        if isinstance(data, list):
+            for item in data:
+                try:
+                    o = (item.get("original") or "").strip()
+                    r = (item.get("recognized") or "").strip()
+                    if o and r:
+                        out.append((o, r))
+                except Exception:
+                    continue
+        logging.getLogger("semantic-bot").info("[Gemini] filtered pairs: %s", len(out) if out else 0)
+        return out or pairs
+    except Exception as e:
+        logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
+        return pairs
+
     """
     Финальная фильтрация различий через Gemini.
     ЛОГИ:
