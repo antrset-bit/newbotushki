@@ -10,6 +10,19 @@ import math
 import time
 from typing import List, Tuple
 
+# --- ensure logging shows our INFO messages ---
+_semantic_logger = logging.getLogger("semantic-bot")
+if not _semantic_logger.handlers:
+    _handler = logging.StreamHandler()
+    _formatter = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
+    _handler.setFormatter(_formatter)
+    _semantic_logger.addHandler(_handler)
+# If uvicorn set root level to WARNING, bump our logger level to INFO explicitly
+_semantic_logger.setLevel(logging.INFO)
+del _handler, _formatter
+
+
+
 
 
 
@@ -895,6 +908,13 @@ PAIRS:
     )
 
 async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], api_key: str | None):
+
+log = logging.getLogger("semantic-bot")
+try:
+    key_present = bool(api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+except Exception:
+    key_present = False
+log.info("[Gemini] entry: pairs=%s, key_present=%s", len(pairs) if pairs else 0, key_present)
     log = logging.getLogger("semantic-bot")
     if not pairs:
         return []
@@ -977,3 +997,13 @@ async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], a
     log.info("[Gemini] filtered pairs total: %s (from %s)", len(filtered_total), len(pairs))
     return filtered_total
 
+
+
+# Shims: if the rest of the code calls other names, route them here
+gemini_semantic_filter_sentence_pairs = _gemini_semantic_filter_sentence_pairs
+gemini_filter_pairs = _gemini_semantic_filter_sentence_pairs
+
+
+async def _gemini_probe_log():
+    log = logging.getLogger("semantic-bot")
+    log.info("[Gemini] probe: logger configured and alive")
