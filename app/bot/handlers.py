@@ -660,6 +660,7 @@ async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
         return []
     if not api_key:
         return pairs
+    print('[Gemini] filtering enabled, pairs:', len(pairs))
     try:
         client = genai.Client(api_key=api_key)
         items = [{"original": o, "recognized": r} for (o, r) in pairs]
@@ -695,6 +696,7 @@ PAIRS:
                         out.append((o, r))
                 except Exception:
                     continue
+        print('[Gemini] filtered pairs:', len(out) if out else 0)
         return out or pairs
     except Exception:
         return pairs
