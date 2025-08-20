@@ -1,8 +1,24 @@
+import time
+import asyncio
+import logging
+import json
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
 import os, re, time, asyncio, logging, difflib, json
 from pathlib import Path
 from typing import Any, Optional
+
+# --- ensure logging shows our INFO messages ---
+_semantic_logger = logging.getLogger("semantic-bot")
+if not _semantic_logger.handlers:
+    _handler = logging.StreamHandler()
+    _formatter = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
+    _handler.setFormatter(_formatter)
+    _semantic_logger.addHandler(_handler)
+_semantic_logger.setLevel(logging.INFO)
+del _handler, _formatter
+
+
 
 from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
 from telegram.ext import MessageHandler, CommandHandler, filters, ApplicationBuilder
@@ -634,11 +650,53 @@ async def doc_check(update: Update, context: Any):
     await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
 
-async def doc_compare(update: Update, context: Any):
+
+async def doc_compare(update, context):
     docs = context.user_data.get("work_docs") or []
     if len(docs) < 2:
         await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
         return
+    a, b = docs[-2], docs[-1]
+    text_a = a.get("text") or ""
+    text_b = b.get("text") or ""
+
+    raw_pairs = _pair_sentences(text_a, text_b)
+    logging.getLogger("semantic-bot").info("[Gemini] call site: got %s raw pairs before filtering", len(raw_pairs))
+    try:
+        filtered = await _gemini_semantic_filter_sentence_pairs(raw_pairs, api_key=None)
+    except Exception as e:
+        logging.getLogger("semantic-bot").exception("[Gemini] filtering call failed — using heuristic: %r", e)
+        filtered = [(o, r) for (o, r) in raw_pairs if _heuristic_semantic_diff(o, r)]
+
+    # prefer user's existing writer if present
+    if "_save_docx_compare_tables" in globals():
+        filename = f"{int(time.time())}_changes_{Path(a.get('name','orig')).stem}_to_{Path(b.get('name','rec')).stem}.docx"
+        path = _save_docx_compare_tables(filtered, filename)
+    else:
+        # fallback minimal writer
+        filename = f"{int(time.time())}_changes_{Path(a.get('name','orig')).stem}_to_{Path(b.get('name','rec')).stem}.docx"
+        path = os.path.join(os.getcwd(), filename)
+        try:
+            from docx import Document as DocxDocument
+            doc = DocxDocument()
+            table = doc.add_table(rows=1, cols=2)
+            table.rows[0].cells[0].text = "Оригинал (DOCX)"
+            table.rows[0].cells[1].text = "Распознанный (OCR)"
+            for o, r in filtered:
+                row = table.add_row().cells
+                row[0].text = o or "—"
+                row[1].text = r or "—"
+            doc.save(path)
+        except Exception as e:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("Оригинал\tРаспознанный\n")
+                for o, r in filtered:
+                    f.write(f"{o}\t{r}\n")
+
+    with open(path, "rb") as f:
+        await update.message.reply_document(InputFile(f, filename=os.path.basename(path)))
+    return
+
     a, b = docs[-2], docs[-1]
     text_a = a.get("text") or ""
     text_b = b.get("text") or ""
@@ -1004,3 +1062,44 @@ def _save_docx_semantic_pairs(filename: str, doc_name_a: str, doc_name_b: str, p
         row[1].text = r or "—"
     doc.save(path)
     return path
+
+
+
+def _extract_json_array(raw: str):
+    if not raw:
+        return []
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+    try:
+        data = json.loads(s)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    l = s.find("["); r = s.rfind("]")
+    if l != -1 and r != -1 and r > l:
+        chunk = s[l:r+1].strip()
+        try:
+            data = json.loads(chunk)
+            return data if isinstance(data, list) else []
+        except Exception:
+            parts = re.split(r"\]\s*[\r\n]+\s*\[", chunk.strip()[1:-1])
+            items = []
+            for part in parts:
+                pj = "[" + part.strip() + "]"
+                try:
+                    items.extend(json.loads(pj))
+                except Exception:
+                    pass
+            if items:
+                return items
+    objs = re.findall(r"\{[^{}]*\}", s, flags=re.DOTALL)
+    if objs:
+        try:
+            return [json.loads(o) for o in objs]
+        except Exception:
+            pass
+    return []
+
