@@ -908,13 +908,12 @@ PAIRS:
     )
 
 async def _gemini_semantic_filter_sentence_pairs(pairs: List[Tuple[str, str]], api_key: str | None):
-
-log = logging.getLogger("semantic-bot")
-try:
+    log = logging.getLogger("semantic-bot")
+    try:
     key_present = bool(api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
-except Exception:
+    except Exception:
     key_present = False
-log.info("[Gemini] entry: pairs=%s, key_present=%s", len(pairs) if pairs else 0, key_present)
+    log.info("[Gemini] entry: pairs=%s, key_present=%s", len(pairs) if pairs else 0, key_present)
     log = logging.getLogger("semantic-bot")
     if not pairs:
         return []
