@@ -1004,5 +1004,10 @@ gemini_filter_pairs = _gemini_semantic_filter_sentence_pairs
 
 
 async def _gemini_probe_log():
-    log = logging.getLogger("semantic-bot")
-    log.info("[Gemini] probe: logger configured and alive")
+    try:
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        key_present = bool(api_key)
+        log = logging.getLogger("semantic-bot")
+        log.info("[Gemini] API key present (probe): %s", key_present)
+    except Exception as e:
+        logging.getLogger("semantic-bot").error("[Gemini] probe log failed: %s", e)
