@@ -4,6 +4,17 @@ import os, re, time, asyncio, logging, difflib
 from pathlib import Path
 from typing import Any, Optional
 
+# Sentence splitting regex
+_SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|\n+')
+
+def _split_sentences(text: str):
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    return parts
+
+
 from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
 from telegram.ext import MessageHandler, CommandHandler, filters, ApplicationBuilder
 
@@ -55,38 +66,40 @@ INDEX_DEDUP_TTL = 600
 
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
     parts, buf, cur = [], [], 0
-    for p in text.replace("\r\n", "\n").split("
-
-# --- Gemini API key presence check (one-time) ---
-GEMINI_KEY_CHECK_DONE = False
-def _log_gemini_key_presence():
-    global GEMINI_KEY_CHECK_DONE
-    if GEMINI_KEY_CHECK_DONE:
-        return
-    _key_present = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
-    logging.getLogger("semantic-bot").info("[Gemini] API key present: %s", _key_present)
-    GEMINI_KEY_CHECK_DONE = True
-_log_gemini_key_presence()
-\n\n"):
+    for p in text.replace("
+", "
+").split("
+"):
         p = p.strip()
         if not p:
-            chunk = "\n\n".join(buf).strip()
-            if chunk: parts.append(chunk)
+            chunk = "
+
+".join(buf).strip()
+            if chunk:
+                parts.append(chunk)
             buf, cur = [], 0
             continue
         need = len(p) + (2 if cur > 0 else 0)
         if cur + need <= max_len:
-            buf.append(p); cur += need
+            buf.append(p)
+            cur += need
         else:
-            chunk = "\n\n".join(buf).strip()
-            if chunk: parts.append(chunk)
+            chunk = "
+
+".join(buf).strip()
+            if chunk:
+                parts.append(chunk)
             buf, cur = [], 0
             while len(p) > max_len:
-                parts.append(p[:max_len]); p = p[max_len:]
+                parts.append(p[:max_len])
+                p = p[max_len:]
             if p:
                 buf, cur = [p], len(p)
-    chunk = "\n\n".join(buf).strip()
-    if chunk: parts.append(chunk)
+    chunk = "
+
+".join(buf).strip()
+    if chunk:
+        parts.append(chunk)
     return parts
 
 async def send_long(update: Update, text: str):
@@ -829,3 +842,65 @@ async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
         logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
         return pairs
 \n
+
+def _extract_json_array(raw: str):
+    import json, re
+    if not raw:
+        return []
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+    try:
+        data = json.loads(s)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    l = s.find("["); r = s.rfind("]")
+    if l != -1 and r != -1 and r > l:
+        chunk = s[l:r+1].strip()
+        try:
+            data = json.loads(chunk); 
+            return data if isinstance(data, list) else []
+        except Exception:
+            parts = re.split(r"\]\s*[\r\n]+\s*\[", chunk.strip()[1:-1])
+            items = []
+            for part in parts:
+                pj = "[" + part.strip() + "]"
+                try:
+                    items.extend(json.loads(pj))
+                except Exception:
+                    pass
+            if items:
+                return items
+    objs = re.findall(r"\{[^{}]*\}", s, flags=re.DOTALL)
+    if objs:
+        try:
+            return [json.loads(o) for o in objs]
+        except Exception:
+            pass
+    return []
+
+
+def _pair_sentences(a_text: str, b_text: str):
+    a_s = _split_sentences(a_text)
+    b_s = _split_sentences(b_text)
+    sm = difflib.SequenceMatcher(a=a_s, b=b_s, autojunk=False)
+    pairs = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "replace":
+            for i in range(max(i2-i1, j2-j1)):
+                o = a_s[i1+i] if i1+i < i2 else ""
+                r = b_s[j1+i] if j1+i < j2 else ""
+                if o or r:
+                    pairs.append((o, r))
+        elif tag == "delete":
+            for i in range(i1, i2):
+                pairs.append((a_s[i], ""))
+        elif tag == "insert":
+            for j in range(j1, j2):
+                pairs.append(("", b_s[j]))
+    return pairs
