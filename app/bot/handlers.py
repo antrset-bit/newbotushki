@@ -65,16 +65,15 @@ PDF_DEDUP_TTL = 120
 INDEX_DEDUP_TTL = 600
 
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
+    """
+    Делит длинный текст на части, чтобы они влезали в лимит Telegram.
+    Разбивает по переводам строк, а если кусок всё равно длиннее max_len — режет принудительно.
+    """
     parts, buf, cur = [], [], 0
-    for p in text.replace("
-", "
-").split("
-"):
+    for p in text.replace("\r\n", "\n").split("\n"):  # ← здесь была ошибка, теперь кавычки закрыты
         p = p.strip()
         if not p:
-            chunk = "
-
-".join(buf).strip()
+            chunk = "\n\n".join(buf).strip()
             if chunk:
                 parts.append(chunk)
             buf, cur = [], 0
@@ -84,9 +83,7 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> l
             buf.append(p)
             cur += need
         else:
-            chunk = "
-
-".join(buf).strip()
+            chunk = "\n\n".join(buf).strip()
             if chunk:
                 parts.append(chunk)
             buf, cur = [], 0
@@ -95,9 +92,7 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> l
                 p = p[max_len:]
             if p:
                 buf, cur = [p], len(p)
-    chunk = "
-
-".join(buf).strip()
+    chunk = "\n\n".join(buf).strip()
     if chunk:
         parts.append(chunk)
     return parts
