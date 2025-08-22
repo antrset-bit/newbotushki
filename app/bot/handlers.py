@@ -1,18 +1,24 @@
+import inspect
+import time
+import asyncio
+import logging
+import json
 # (same as the "updated_ocr_handlers.zip" version I prepared earlier)
 # Included here in full for convenience.
-import os, re, time, asyncio, logging, difflib
+import os, re, time, asyncio, logging, difflib, json
 from pathlib import Path
 from typing import Any, Optional
 
-# Sentence splitting regex
-_SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|\n+')
+# --- ensure logging shows our INFO messages ---
+_semantic_logger = logging.getLogger("semantic-bot")
+if not _semantic_logger.handlers:
+    _handler = logging.StreamHandler()
+    _formatter = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
+    _handler.setFormatter(_formatter)
+    _semantic_logger.addHandler(_handler)
+_semantic_logger.setLevel(logging.INFO)
+del _handler, _formatter
 
-def _split_sentences(text: str):
-    text = (text or "").strip()
-    if not text:
-        return []
-    parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
-    return parts
 
 
 from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
@@ -65,36 +71,27 @@ PDF_DEDUP_TTL = 120
 INDEX_DEDUP_TTL = 600
 
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
-    """
-    Делит длинный текст на части, чтобы они влезали в лимит Telegram.
-    Разбивает по переводам строк, а если кусок всё равно длиннее max_len — режет принудительно.
-    """
     parts, buf, cur = [], [], 0
-    for p in text.replace("\r\n", "\n").split("\n"):  # ← здесь была ошибка, теперь кавычки закрыты
+    for p in text.replace("\r\n", "\n").split("\n\n"):
         p = p.strip()
         if not p:
             chunk = "\n\n".join(buf).strip()
-            if chunk:
-                parts.append(chunk)
+            if chunk: parts.append(chunk)
             buf, cur = [], 0
             continue
         need = len(p) + (2 if cur > 0 else 0)
         if cur + need <= max_len:
-            buf.append(p)
-            cur += need
+            buf.append(p); cur += need
         else:
             chunk = "\n\n".join(buf).strip()
-            if chunk:
-                parts.append(chunk)
+            if chunk: parts.append(chunk)
             buf, cur = [], 0
             while len(p) > max_len:
-                parts.append(p[:max_len])
-                p = p[max_len:]
+                parts.append(p[:max_len]); p = p[max_len:]
             if p:
                 buf, cur = [p], len(p)
     chunk = "\n\n".join(buf).strip()
-    if chunk:
-        parts.append(chunk)
+    if chunk: parts.append(chunk)
     return parts
 
 async def send_long(update: Update, text: str):
@@ -446,7 +443,6 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
         finally:
             _pdf_job_finish(context, key)
         return
-
     # DOC / DOCX
     if ext == "docx":
         text = extract_text_from_docx(file_path)
@@ -456,7 +452,6 @@ async def _work_handle_file(update: Update, context: Any, document: Document):
     if not (text or "").strip():
         await update.message.reply_text("Не удалось извлечь текст из документа. Убедитесь, что это не пустой/защищённый файл.")
         return
-
     chunks = smart_split_text(text)
     context.user_data.setdefault("work_docs", []).append({"name": fname, "path": file_path, "text": text, "chunks": chunks})
     await update.message.reply_text(f"Файл добавлен в контекст: {fname}. Документов в сессии: {len(context.user_data['work_docs'])}.")
@@ -471,11 +466,9 @@ async def handle_file(update: Update, context: Any):
     if ext not in ("pdf", "docx", "txt", "doc"):
         await update.message.reply_text("Поддерживаются только PDF, DOCX, DOC (и TXT для глобальной индексации).")
         return
-
     if context.user_data.get("mode") == "work":
         await _work_handle_file(update, context, document)
         return
-
     os.makedirs(DOC_FOLDER, exist_ok=True)
     ts = int(time.time())
     file_path = os.path.join(DOC_FOLDER, f"{base}_{ts}.{ext}")
@@ -492,12 +485,10 @@ async def handle_file(update: Update, context: Any):
     if file_hash and file_hash in manifest.get("hashes", {}):
         await update.message.reply_text("Этот файл уже проиндексирован ранее. Можете задавать вопросы.")
         return
-
     # start indexing once; dedup by file_unique_id + hash
     key = _index_job_key(document.file_unique_id, file_hash)
     if _idx_is_running(context, key):
         return
-
     progress = await update.message.reply_text("Файл загружен. Индексация началась…")
     _idx_start(context, key, progress.message_id)
 
@@ -653,7 +644,10 @@ async def doc_check(update: Update, context: Any):
     await send_long(update, f"🔎 Проверка договора: {last['name']}\n\n{answer}")
     await _reply_with_docx(update, f"Проверка договора: {last['name']}", answer, f"check_{Path(last['name']).stem}")
 
-async def doc_compare(update: Update, context: Any):
+
+
+
+async def doc_compare(update, context):
     docs = context.user_data.get("work_docs") or []
     if len(docs) < 2:
         await update.message.reply_text("Нужно минимум два документа. Загрузите ещё один и повторите /doc_compare.")
@@ -661,10 +655,31 @@ async def doc_compare(update: Update, context: Any):
     a, b = docs[-2], docs[-1]
     text_a = a.get("text") or ""
     text_b = b.get("text") or ""
-    filename = f"{int(time.time())}_changes_{Path(a['name']).stem}_to_{Path(b['name']).stem}.docx"
-    path = _save_docx_compare_tables(filename, a['name'], b['name'], text_a, text_b)
-    with open(path, "rb") as f:
-        await update.message.reply_document(InputFile(f, filename=filename))
+
+    raw_pairs = _pair_sentences(text_a, text_b)
+    logging.getLogger("semantic-bot").info("[Gemini] call site: got %s raw pairs before filtering", len(raw_pairs))
+    try:
+        filtered = await _gemini_semantic_filter_sentence_pairs(raw_pairs, api_key=None)
+    except Exception as e:
+        logging.getLogger("semantic-bot").exception("[Gemini] filtering call failed — using heuristic: %r", e)
+        filtered = [(o, r) for (o, r) in raw_pairs if _heuristic_semantic_diff(o, r)]
+
+    filename = f"{int(time.time())}_changes_{Path(a.get('name','original')).stem}_to_{Path(b.get('name','recognized')).stem}.docx"
+    path = _save_compare_report_with_adapter(
+        filtered_pairs=filtered,
+        filename=filename,
+        a_name=a.get('name','original.docx'),
+        b_name=b.get('name','recognized.docx'),
+        text_a=text_a,
+        text_b=text_b,
+    )
+
+    try:
+        with open(path, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename=os.path.basename(path)))
+    except Exception:
+        await update.message.reply_text(f"Файл подготовлен: {path}")
+
 
 async def doc_clear(update: Update, context: Any):
     docs = context.user_data.get("work_docs") or []
@@ -716,7 +731,6 @@ async def handle_text(update: Update, context: Any):
             left = max(0, DAILY_FREE_LIMIT - get_usage(uid))
             await update.message.reply_text(f"Остаток на сегодня: {left}.")
         return
-
     if mode == "work":
         docs = context.user_data.get("work_docs") or []
         if not docs:
@@ -728,7 +742,6 @@ async def handle_text(update: Update, context: Any):
             answer = "Краткая справка по загруженным документам:\n" + _fallback_summary("\n\n".join(retrieved) if retrieved else docs[-1]["text"])
         await send_long(update, answer)
         return
-
     if mode == "tm":
         low = user_query.lower()
         if low.startswith("/tm_reg"):
@@ -737,11 +750,9 @@ async def handle_text(update: Update, context: Any):
             await tm_cmd_exp(update, context); return
         await tm_handle_text(update, context)
         return
-
     if not (os.path.exists(INDEX_FILE) and os.path.exists(TEXTS_FILE)):
         await update.message.reply_text("Нет проиндексированных документов. Сначала загрузите файл.")
         return
-
     def _answer_job():
         try:
             chunks = retrieve_chunks(user_query, k=RETRIEVAL_K)
@@ -782,101 +793,200 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     return app
-\n\n
+
+
+# ================== Gemini: батч-фильтрация различий ==================
+from typing import List, Tuple
+
+def _truncate(s: str, max_chars: int = 2000) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= max_chars else (s[: max_chars - 10] + " [TRUNC]")
+
+def _normalize_for_semantic(s: str) -> str:
+    import re
+    s = (s or "").lower()
+    s = re.sub(r"[\s]+", " ", s)
+    s = re.sub(r"[.,;:!?\"'«»()\[\]{}–—-]", "", s)
+    return s.strip()
+
+def _numbers_in(s: str):
+    import re
+    return re.findall(r"\d+[\d\s.,/-]*\d|\d+", s)
+
+def _heuristic_semantic_diff(o: str, r: str) -> bool:
+    o_norm, r_norm = _normalize_for_semantic(o), _normalize_for_semantic(r)
+    if o_norm == r_norm:
+        return False
+    if _numbers_in(o_norm) != _numbers_in(r_norm):
+        return True
+    try:
+        import difflib
+        return difflib.SequenceMatcher(a=o_norm, b=r_norm).ratio() < 0.9
+    except Exception:
+        return True
+
+async def _count_tokens_safe(model, text: str) -> int:
+    try:
+        ct = await asyncio.to_thread(model.count_tokens, text)
+        for attr in ("total_tokens", "total_token_count", "token_count"):
+            if hasattr(ct, attr):
+                val = getattr(ct, attr)
+                try:
+                    return int(getattr(val, "value", val))
+                except Exception:
+                    try:
+                        return int(val)
+                    except Exception:
+                        pass
+        return 0
+    except Exception:
+        return (len(text) + 3) // 4
+
+def _batch_pairs_by_limits(items: List[Tuple[str, str]], max_pairs: int = 60, max_chars: int = 18000):
+    batch, cur_chars = [], 0
+    for (o, r) in items:
+        o_t, r_t = _truncate(o), _truncate(r)
+        payload = json.dumps({"original": o_t, "recognized": r_t}, ensure_ascii=False)
+        if (len(batch) >= max_pairs) or (cur_chars + len(payload) > max_chars):
+            if batch:
+                yield batch
+            batch, cur_chars = [], 0
+        batch.append((o_t, r_t))
+        cur_chars += len(payload)
+    if batch:
+        yield batch
+
+def _build_prompt(items: List[Tuple[str, str]]) -> str:
+    return (
+        """Ты — юридический редактор. Даны пары предложений из договора.
+- ORIGINAL — из исходного DOCX
+- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)
+
+Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).
+Игнорируй различия в пробелах, регистре и пунктуации.
+Если в паре различаются ЧИСЛА или даты — это смысловое отличие.
+
+Верни ЧИСТЫЙ JSON-массив объектов (без подсказок/комментариев, БЕЗ Markdown-кода):
+[
+  {"original": "...", "recognized": "..."},
+  ...
+]
+
+PAIRS:
+"""
+        + json.dumps([{"original": o, "recognized": r} for (o, r) in items], ensure_ascii=False)
+    )
+
+
 async def _gemini_semantic_filter_sentence_pairs(pairs, api_key: str | None):
-    """
-    Финальная фильтрация различий через Gemini.
-    ЛОГИ:
-      - [Gemini] filtering enabled, pairs: N
-      - [Gemini] filtered pairs: M
-      - [Gemini] filter failed: <error>
-    """
+    log = logging.getLogger("semantic-bot")
+    log.info("[Gemini] entry: pairs=%s", len(pairs) if pairs else 0)
+
     if not pairs:
+        log.info("[Gemini] no pairs — nothing to filter")
         return []
-    # 0) Ключ
+
     key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not key:
-        logging.getLogger("semantic-bot").info("[Gemini] API key missing — skip filtering")
-        return pairs
+        log.info("[Gemini] API key missing — skip filtering; using heuristic")
+        return [(o, r) for (o, r) in pairs if _heuristic_semantic_diff(o, r)]
+
     try:
-        logging.getLogger("semantic-bot").info("[Gemini] filtering enabled, pairs: %s", len(pairs))
-        # 1) Конфиг клиента
+        import google.generativeai as genai
         genai.configure(api_key=key)
         model = genai.GenerativeModel("gemini-1.5-flash")
-        # 2) Формируем промпт
-        items = [{"original": o, "recognized": r} for (o, r) in pairs]
-        prompt = (
-            "Ты — юридический редактор. Даны пары предложений из договора:\n"
-            "- ORIGINAL — из исходного DOCX\n"
-            "- RECOGNIZED — из распознанного PDF (OCR-ошибки возможны)\n\n"
-            "Нужно оставить ТОЛЬКО пары со смысловым отличием (разные значения).\n"
-            "Игнорируй различия в пробелах, регистре и пунктуации.\n"
-            "Если в паре различаются ЧИСЛА или даты — это смысловое отличие.\n\n"
-            "Верни ЧИСТЫЙ JSON-массив объектов без обрамления кода:\n"
-            "{\"original\": \"...\", \"recognized\": \"...\"} — только для пар с СМЫСЛОВЫМ отличием.\n\n"
-            "PAIRS:\n"
-            + json.dumps(items, ensure_ascii=False)
-        )
-        # 3) Вызов модели
-        resp = await asyncio.to_thread(lambda: model.generate_content([{"role":"user","parts":[{"text": prompt}]}]))
-        raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
-        data = json.loads(raw) if raw else []
-        out = []
-        if isinstance(data, list):
-            for item in data:
-                try:
-                    o = (item.get("original") or "").strip()
-                    r = (item.get("recognized") or "").strip()
-                    if o and r:
-                        out.append((o, r))
-                except Exception:
-                    continue
-        logging.getLogger("semantic-bot").info("[Gemini] filtered pairs: %s", len(out) if out else 0)
-        return out or pairs
     except Exception as e:
-        logging.getLogger("semantic-bot").exception("[Gemini] filter failed: %r", e)
-        return pairs
-\n
+        log.exception("[Gemini] init failed: %r — using heuristic", e)
+        return [(o, r) for (o, r) in pairs if _heuristic_semantic_diff(o, r)]
 
-def _extract_json_array(raw: str):
-    import json, re
-    if not raw:
-        return []
-    s = raw.strip()
-    if s.startswith("```"):
-        s = s.strip("`").strip()
-        if s.lower().startswith("json"):
-            s = s[4:].strip()
-    try:
-        data = json.loads(s)
-        return data if isinstance(data, list) else []
-    except Exception:
-        pass
-    l = s.find("["); r = s.rfind("]")
-    if l != -1 and r != -1 and r > l:
-        chunk = s[l:r+1].strip()
+    # smaller batches
+    def _batch_pairs_by_limits(items, max_pairs: int = 40, max_chars: int = 12000):
+        batch, cur_chars = [], 0
+        for (o, r) in items:
+            o_t, r_t = (o or "").strip(), (r or "").strip()
+            payload = json.dumps({"original": o_t, "recognized": r_t}, ensure_ascii=False)
+            if (len(batch) >= max_pairs) or (cur_chars + len(payload) > max_chars):
+                if batch:
+                    yield batch
+                batch, cur_chars = [], 0
+            batch.append((o_t, r_t))
+            cur_chars += len(payload)
+        if batch:
+            yield batch
+
+    batches = list(_batch_pairs_by_limits(pairs, max_pairs=40, max_chars=12000))
+    log.info("[Gemini] filtering enabled, total pairs: %s, batches: %s", len(pairs), len(batches))
+
+    filtered_total = []
+    disable_gemini_for_run = False
+
+    for i, batch in enumerate(batches):
+        if disable_gemini_for_run:
+            filtered_total.extend([(o, r) for (o, r) in batch if _heuristic_semantic_diff(o, r)])
+            continue
+
+        prompt = _build_prompt(batch)
         try:
-            data = json.loads(chunk); 
-            return data if isinstance(data, list) else []
-        except Exception:
-            parts = re.split(r"\]\s*[\r\n]+\s*\[", chunk.strip()[1:-1])
-            items = []
-            for part in parts:
-                pj = "[" + part.strip() + "]"
-                try:
-                    items.extend(json.loads(pj))
-                except Exception:
-                    pass
-            if items:
-                return items
-    objs = re.findall(r"\{[^{}]*\}", s, flags=re.DOTALL)
-    if objs:
-        try:
-            return [json.loads(o) for o in objs]
+            tok = await _count_tokens_safe(model, prompt)
+            if tok > 30000 and len(batch) > 1:
+                mid = len(batch) // 2
+                batches[i:i+1] = [batch[:mid], batch[mid:]]
+                log.info("[Gemini] split batch %s due to token estimate %s", i+1, tok)
+                continue
         except Exception:
             pass
-    return []
 
+        attempt, last_err = 0, None
+        while attempt < 2 and not disable_gemini_for_run:
+            attempt += 1
+            try:
+                log.info("[Gemini] batch %s/%s, size: %s (attempt %s)", i+1, len(batches), len(batch), attempt)
+                resp = await asyncio.to_thread(
+                    lambda: model.generate_content(
+                        contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                        generation_config={
+                            "response_mime_type": "application/json",
+                            "temperature": 0.0,
+                            "candidate_count": 1,
+                        },
+                    )
+                )
+                raw = getattr(resp, "text", None) or getattr(resp, "output_text", None) or ""
+                data = _extract_json_array(raw)
+                if not isinstance(data, list):
+                    raise ValueError("Gemini did not return a JSON array")
+
+                kept = 0
+                for item in data:
+                    o = (item.get("original") or "").strip() if isinstance(item, dict) else ""
+                    r = (item.get("recognized") or "").strip() if isinstance(item, dict) else ""
+                    if o and r and _heuristic_semantic_diff(o, r):
+                        filtered_total.append((o, r)); kept += 1
+                log.info("[Gemini] batch %s kept: %s/%s", i+1, kept, len(batch))
+                break
+            except Exception as e:
+                last_err = e
+                msg = f"{e.__class__.__name__}: {e}"
+                log.warning("[Gemini] batch %s failed: %s", i+1, msg)
+                if ("ResourceExhausted" in e.__class__.__name__) or ("quota" in str(e).lower()):
+                    log.error("[Gemini] quota hit — disabling Gemini for this run, using heuristic for remaining batches")
+                    disable_gemini_for_run = True
+                    break
+                await asyncio.sleep(0.6 * attempt)
+
+        if last_err and (attempt >= 2 or disable_gemini_for_run):
+            log.error("[Gemini] batch %s fallback to heuristic due to persistent error: %r", i+1, last_err)
+            filtered_total.extend([(o, r) for (o, r) in batch if _heuristic_semantic_diff(o, r)])
+
+    log.info("[Gemini] filtered pairs total: %s (from %s)", len(filtered_total), len(pairs))
+    return filtered_total
+
+def _split_sentences(text: str):
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    return parts
 
 def _pair_sentences(a_text: str, b_text: str):
     a_s = _split_sentences(a_text)
@@ -899,3 +1009,143 @@ def _pair_sentences(a_text: str, b_text: str):
             for j in range(j1, j2):
                 pairs.append(("", b_s[j]))
     return pairs
+
+def _save_docx_semantic_pairs(filename: str, doc_name_a: str, doc_name_b: str, pairs):
+    os.makedirs(DOC_FOLDER, exist_ok=True)
+    path = os.path.join(DOC_FOLDER, filename)
+    doc = DocxDocument()
+    doc.add_heading(f"Смысловые отличия: {doc_name_a} → {doc_name_b}", level=1)
+    if not pairs:
+        doc.add_paragraph("Смысловых отличий не найдено.")
+        doc.save(path); return path
+
+    table = doc.add_table(rows=1, cols=2)
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = "Оригинал (DOCX)"
+    hdr_cells[1].text = "Распознанный (OCR)"
+    for (o, r) in pairs:
+        row = table.add_row().cells
+        row[0].text = o or "—"
+        row[1].text = r or "—"
+    doc.save(path)
+    return path
+
+
+
+def _extract_json_array(raw: str):
+    if not raw:
+        return []
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+    try:
+        data = json.loads(s)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    l = s.find("["); r = s.rfind("]")
+    if l != -1 and r != -1 and r > l:
+        chunk = s[l:r+1].strip()
+        try:
+            data = json.loads(chunk)
+            return data if isinstance(data, list) else []
+        except Exception:
+            parts = re.split(r"\]\s*[\r\n]+\s*\[", chunk.strip()[1:-1])
+            items = []
+            for part in parts:
+                pj = "[" + part.strip() + "]"
+                try:
+                    items.extend(json.loads(pj))
+                except Exception:
+                    pass
+            if items:
+                return items
+    objs = re.findall(r"\{[^{}]*\}", s, flags=re.DOTALL)
+    if objs:
+        try:
+            return [json.loads(o) for o in objs]
+        except Exception:
+            pass
+    return []
+
+
+
+
+
+def _save_compare_report_with_adapter(filtered_pairs, filename, a_name, b_name, text_a, text_b):
+    """
+    Universal caller for project _save_docx_compare_tables with signature detection.
+    Tries keyword invocation via inspect.signature; then tries several positional orders.
+    Fallbacks to DOCX/TSV writer.
+    """
+    if "_save_docx_compare_tables" in globals():
+        fn = _save_docx_compare_tables
+        # Keyword attempt
+        try:
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.keys())
+            kwargs = {}
+            mapping = {
+                "pairs": filtered_pairs,
+                "filtered_pairs": filtered_pairs,
+                "filename": filename,
+                "doc_name_a": a_name,
+                "doc_name_b": b_name,
+                "text_a": text_a,
+                "text_b": text_b,
+            }
+            for p in params:
+                if p in mapping:
+                    kwargs[p] = mapping[p]
+            if kwargs and ("filename" in kwargs and ("pairs" in kwargs or "filtered_pairs" in kwargs)):
+                return fn(**kwargs)
+        except Exception:
+            logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables kwargs call failed; try positional")
+
+        # Positional attempts
+        orders = [
+            (filename, filtered_pairs, b_name, text_a, text_b),
+            (filename, filtered_pairs, a_name, b_name, text_a, text_b),
+            (filtered_pairs, filename, b_name, text_a, text_b),
+            (filtered_pairs, filename, a_name, b_name, text_a, text_b),
+        ]
+        for args in orders:
+            try:
+                return fn(*args)
+            except TypeError:
+                continue
+            except Exception:
+                logging.getLogger("semantic-bot").exception("Project _save_docx_compare_tables positional attempt failed; trying next")
+        logging.getLogger("semantic-bot").error("Project _save_docx_compare_tables signature mismatch — using fallback writer")
+
+    # Fallback writer
+    try:
+        from docx import Document as DocxDocument
+        os.makedirs("generated_reports", exist_ok=True)
+        path = os.path.join("generated_reports", filename)
+        doc = DocxDocument()
+        doc.add_heading(f"Смысловые отличия: {a_name} → {b_name}", level=1)
+        if not filtered_pairs:
+            doc.add_paragraph("Смысловых отличий не найдено.")
+        else:
+            table = doc.add_table(rows=1, cols=2)
+            table.rows[0].cells[0].text = "Оригинал (DOCX)"
+            table.rows[0].cells[1].text = "Распознанный (OCR)"
+            for o, r in filtered_pairs:
+                row = table.add_row().cells
+                row[0].text = o or "—"
+                row[1].text = r or "—"
+        doc.save(path)
+        return path
+    except Exception:
+        os.makedirs("generated_reports", exist_ok=True)
+        path = os.path.join("generated_reports", filename.replace(".docx", ".tsv"))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("Оригинал\tРаспознанный\n")
+            for o, r in filtered_pairs:
+                line_o = (o or "").replace("\t", " ")
+                line_r = (r or "").replace("\t", " ")
+                f.write(line_o + "\t" + line_r + "\n")
+        return path
