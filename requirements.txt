@@ -1,0 +1,22 @@
+fastapi==0.111.0
+uvicorn==0.30.1
+gunicorn==22.0.0
+python-telegram-bot==21.4
+numpy==1.26.4
+faiss-cpu==1.8.0
+PyMuPDF==1.24.7
+pdf2image==1.17.0
+pytesseract==0.3.10
+python-docx==1.1.2
+google-genai==0.7.0
+requests==2.32.3
+pillow==10.3.0
+python-multipart==0.0.9
+# Pydantic v2 (для fastapi==0.111.0)
+pydantic==2.7.1
+pydantic-core==2.18.2
+pydantic-settings==2.3.4
+google-generativeai>=0.7.0
+
+# (опционально) для улучшенной бинаризации
+# scipy==1.13.1

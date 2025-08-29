@@ -1,0 +1,7 @@
+[ok] app/services/indexing.py: replaced pattern chunks\s*=\s*smart_split_text\(\s*text\s... (1x)
+[ok] Patched app/services/indexing.py
+[skip] /mnt/data/project_fixed/newbotushki-main/app/indexing.py not found
+[skip] /mnt/data/project_fixed/newbotushki-main/app/services/retrieval.py not found
+[skip] /mnt/data/project_fixed/newbotushki-main/app/services/search.py not found
+[ok] Patched app/services/generation.py (fallback message)
+[skip] /mnt/data/project_fixed/newbotushki-main/app/generation.py not found
